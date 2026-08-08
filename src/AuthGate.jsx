@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from "react";
 import {
   onAuthStateChanged,
@@ -5,7 +6,7 @@ import {
   createUserWithEmailAndPassword,
   signOut,
 } from "firebase/auth";
-import { auth } from "./firebaseClient.js";
+import { auth, firebaseInitError } from "./firebaseClient.js";
 import MileageLogger from "./MileageLogger.jsx";
 
 if (typeof window !== "undefined") {
@@ -47,7 +48,16 @@ export default function AuthGate() {
     }
     setBusy(false);
   }
-
+if (firebaseInitError) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center px-6" style={{ fontFamily: "'Manrope', sans-serif" }}>
+        <div className="w-full max-w-sm bg-slate-900 border border-rose-400/30 rounded-2xl p-6">
+          <div className="text-rose-400 font-bold text-sm mb-2">Couldn't connect to Firebase</div>
+          <div className="text-slate-300 text-xs leading-relaxed break-words">{firebaseInitError}</div>
+        </div>
+      </div>
+    );
+}
   if (user === undefined) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
