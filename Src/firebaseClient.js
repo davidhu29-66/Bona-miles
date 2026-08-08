@@ -7,6 +7,12 @@
 // API key is — they identify your project to Google, and real security comes
 // from Firestore Security Rules (see firestore.rules) plus requiring sign-in.
 // It's still good practice to keep them out of source control via .env.
+//
+// This whole block runs the moment the app loads, before React even starts —
+// so if it throws unhandled, the result is a blank white screen with nothing
+// for React's own error handling to catch. Everything below is wrapped in a
+// try/catch specifically so a bad config produces a visible, readable error
+// on screen (via AuthGate.jsx) instead of silence.
 
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
@@ -21,6 +27,25 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-export const db = getFirestore(app);
+export let auth = null;
+export let db = null;
+export let firebaseInitError = null;
+
+try {
+  const missing = Object.entries(firebaseConfig)
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+  if (missing.length) {
+    throw new Error(
+      `Missing Firebase config value(s): ${missing.join(", ")}. These come from ` +
+      `Vercel → your project → Settings → Environment Variables. Check they're ` +
+      `saved, spelled exactly as VITE_FIREBASE_..., and that you Redeployed after ` +
+      `adding them (env vars only apply to builds that run after they're saved).`
+    );
+  }
+  const app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (err) {
+  firebaseInitError = err && err.message ? err.message : String(err);
+}
