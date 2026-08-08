@@ -3,6 +3,7 @@ import {
   Gauge, Clock, Plus, X, Trash2, Settings as SettingsIcon,
   List, BarChart3, ChevronLeft, ChevronRight, Briefcase, Home as HomeIcon,
   Download, ArrowRight, AlertTriangle, Check, Car, LocateFixed, MapPin, Receipt,
+  Radio, Send,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
@@ -84,9 +85,33 @@ function formatDuration(minutes) {
   return `${h}h ${String(m).padStart(2, "0")}m`;
 }
 
+// Full-screen mood art per trip type, shown behind the Start/End/Full Trip
+// modals. Lives in /public/backgrounds — swap the files there to restyle.
+function bgForCategory(category, businessType) {
+  if (category === "private") return "/backgrounds/pvt-mileage.jpg";
+  if (category === "business") {
+    return businessType === "chargeable" ? "/backgrounds/charge-mileage.jpg" : "/backgrounds/admin-mileage.jpg";
+  }
+  return null;
+}
+
+// The app-wide persistent background: "on the move" (mileage art) while a
+// trip is active, "at rest" (time art) once you've arrived somewhere.
+// Chargeable has no dedicated "at rest" asset of its own — time spent at a
+// client site uses the generic Time on site image instead.
+function bgForCategoryAtRest(category, businessType) {
+  if (category === "private") return "/backgrounds/pvt-time.jpg";
+  if (category === "business") {
+    return businessType === "chargeable" ? "/backgrounds/time-onsite.jpg" : "/backgrounds/admin-time.jpg";
+  }
+  return null;
+}
+
 // A "site visit" isn't stored directly — it's derived from two consecutive
 // completed trips where one arrives somewhere and the very next trip departs
 // from that same place. The time between them is time on site.
+// Private arrivals (home, personal stops) are deliberately excluded — this
+// list feeds job/billing tracking, not personal time.
 function computeSiteVisits(trips) {
   const completed = trips.filter((t) => t.mileageIn !== null);
   const sorted = [...completed].sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : 1));
@@ -94,6 +119,7 @@ function computeSiteVisits(trips) {
   for (let i = 0; i < sorted.length - 1; i++) {
     const arrival = sorted[i];
     const next = sorted[i + 1];
+    if (arrival.category === "private") continue;
     if (!arrival.toLocation || next.fromLocation !== arrival.toLocation) continue;
     const arrivalDT = new Date(`${arrival.date}T${arrival.timeIn}`);
     const departureDT = new Date(`${next.date}T${next.timeOut}`);
@@ -121,6 +147,8 @@ export default function MileageLogger() {
   const [loading, setLoading] = useState(true);
   const [trips, setTrips] = useState([]);
   const [locations, setLocations] = useState(DEFAULT_LOCATIONS);
+  const [nodeRedUrl, setNodeRedUrl] = useState("");
+  const [nodeRedEnabled, setNodeRedEnabled] = useState(false);
   const [tab, setTab] = useState("log");
   const [toast, setToast] = useState(null);
 
@@ -147,6 +175,14 @@ export default function MileageLogger() {
       } catch (e) {
         setLocations(DEFAULT_LOCATIONS);
       }
+      try {
+        const res = await window.storage.get("settings", false);
+        const s = res ? JSON.parse(res.value) : {};
+        setNodeRedUrl(s.nodeRedUrl || "");
+        setNodeRedEnabled(!!s.nodeRedEnabled);
+      } catch (e) {
+        // no settings saved yet — defaults are fine
+      }
       setLoading(false);
     })();
   }, []);
@@ -171,6 +207,47 @@ export default function MileageLogger() {
       await window.storage.set("locations", JSON.stringify(next), false);
     } catch (e) {
       showToast("error", "Couldn't save that location.");
+    }
+  }
+
+  async function persistSettings(next) {
+    const merged = { nodeRedUrl, nodeRedEnabled, ...next };
+    if ("nodeRedUrl" in next) setNodeRedUrl(next.nodeRedUrl);
+    if ("nodeRedEnabled" in next) setNodeRedEnabled(next.nodeRedEnabled);
+    try {
+      await window.storage.set("settings", JSON.stringify(merged), false);
+    } catch (e) {
+      showToast("error", "Couldn't save settings.");
+    }
+  }
+
+  // Best-effort push to a Node-RED HTTP-in endpoint. Never blocks trip saving
+  // and never surfaces its own errors as a save failure — logging a trip
+  // should always succeed locally even if the webhook is unreachable (site's
+  // offline, Node-RED restarting, wrong LAN IP, etc). Returns true/false so the
+  // Settings screen's "Send test ping" button can report success explicitly.
+  //
+  // Content-Type is deliberately "text/plain", not "application/json" — the
+  // body is still a JSON string, but application/json makes this a
+  // CORS-"non-simple" request, which triggers a preflight OPTIONS check.
+  // Node-RED's core "http in" node cannot register an OPTIONS route at all
+  // (it's genuinely not in the node — not a config thing), so that preflight
+  // always 404s and the browser blocks the real POST before it ever reaches
+  // Node-RED. text/plain is a CORS-"simple" content type, so it skips
+  // preflight entirely. The receiving flow does JSON.parse(msg.payload).
+  async function syncToNodeRed(payload, { force = false } = {}) {
+    if (!force && !nodeRedEnabled) return false;
+    if (!nodeRedUrl.trim()) return false;
+    try {
+      const res = await fetch(nodeRedUrl.trim(), {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({ ...payload, sentAt: new Date().toISOString() }),
+      });
+      return res.ok;
+    } catch (e) {
+      console.warn("Node-RED sync failed:", e);
+      return false;
     }
   }
 
@@ -202,6 +279,16 @@ export default function MileageLogger() {
     }
     return null;
   }, [trips]);
+
+  // Whole-app mood background: "on the move" while a trip is active,
+  // "at rest" once you've arrived and ended it — reflecting where you
+  // actually are right now, not just what's open in a modal.
+  const appBgImage = useMemo(() => {
+    if (activeTrip) return bgForCategory(activeTrip.category, activeTrip.businessType);
+    const lastCompleted = sortedTrips.find((t) => t.mileageIn !== null);
+    if (!lastCompleted) return null;
+    return bgForCategoryAtRest(lastCompleted.category, lastCompleted.businessType);
+  }, [activeTrip, sortedTrips]);
 
   function upsertLocation(name, lat, lng) {
     const clean = (name || "").trim();
@@ -235,47 +322,49 @@ export default function MileageLogger() {
     upsertLocation(data.fromLocation, data.fromLocationCoords?.lat, data.fromLocationCoords?.lng);
     setShowStart(false);
     showToast("success", "Trip started — safe driving.");
+    syncToNodeRed({ event: "trip_started", trip });
   }
 
   function endTrip(id, data) {
-    const next = trips.map((t) =>
-      t.id === id
-        ? {
-            ...t, timeIn: data.timeIn, mileageIn: Number(data.mileageIn), toLocation: data.toLocation,
-            jobNumber: data.jobNumber || "", siteNotes: data.siteNotes || "",
-          }
-        : t
-    );
+    const updated = {
+      ...trips.find((t) => t.id === id),
+      timeIn: data.timeIn, mileageIn: Number(data.mileageIn), toLocation: data.toLocation,
+      jobNumber: data.jobNumber || "", siteNotes: data.siteNotes || "",
+    };
+    const next = trips.map((t) => (t.id === id ? updated : t));
     persistTrips(next);
     upsertLocation(data.toLocation, data.toLocationCoords?.lat, data.toLocationCoords?.lng);
     setShowEnd(false);
     showToast("success", "Trip logged.");
+    syncToNodeRed({ event: "trip_completed", trip: updated });
   }
 
   function saveFullTrip(data, existingId) {
     if (existingId) {
-      const next = trips.map((t) =>
-        t.id === existingId
-          ? {
-              ...t,
-              date: data.date,
-              timeOut: data.timeOut,
-              mileageOut: Number(data.mileageOut),
-              fromLocation: data.fromLocation,
-              timeIn: data.timeIn,
-              mileageIn: Number(data.mileageIn),
-              toLocation: data.toLocation,
-              category: data.category,
-              businessType: data.category === "business" ? data.businessType : null,
-              client: data.category === "business" && data.businessType === "chargeable" ? (data.client || "") : "",
-              purpose: data.purpose || "",
-              jobNumber: data.jobNumber || "",
-              siteNotes: data.siteNotes || "",
-            }
-          : t
-      );
+      let updated = null;
+      const next = trips.map((t) => {
+        if (t.id !== existingId) return t;
+        updated = {
+          ...t,
+          date: data.date,
+          timeOut: data.timeOut,
+          mileageOut: Number(data.mileageOut),
+          fromLocation: data.fromLocation,
+          timeIn: data.timeIn,
+          mileageIn: Number(data.mileageIn),
+          toLocation: data.toLocation,
+          category: data.category,
+          businessType: data.category === "business" ? data.businessType : null,
+          client: data.category === "business" && data.businessType === "chargeable" ? (data.client || "") : "",
+          purpose: data.purpose || "",
+          jobNumber: data.jobNumber || "",
+          siteNotes: data.siteNotes || "",
+        };
+        return updated;
+      });
       persistTrips(next);
       showToast("success", "Trip updated.");
+      syncToNodeRed({ event: "trip_updated", trip: updated });
     } else {
       const trip = {
         id: uid(),
@@ -295,6 +384,7 @@ export default function MileageLogger() {
       };
       persistTrips([...trips, trip]);
       showToast("success", "Trip added.");
+      syncToNodeRed({ event: "trip_completed", trip });
     }
     upsertLocation(data.fromLocation, data.fromLocationCoords?.lat, data.fromLocationCoords?.lng);
     upsertLocation(data.toLocation, data.toLocationCoords?.lat, data.toLocationCoords?.lng);
@@ -306,6 +396,7 @@ export default function MileageLogger() {
     persistTrips(trips.filter((t) => t.id !== id));
     setConfirmDelete(null);
     showToast("success", "Trip deleted.");
+    syncToNodeRed({ event: "trip_deleted", tripId: id });
   }
 
   if (loading) {
@@ -317,7 +408,7 @@ export default function MileageLogger() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col" style={{ fontFamily: "'Manrope', sans-serif" }}>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col relative" style={{ fontFamily: "'Manrope', sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
         .font-odo { font-family: 'Space Mono', monospace; font-variant-numeric: tabular-nums; }
@@ -325,7 +416,15 @@ export default function MileageLogger() {
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
       `}</style>
 
-      <Header lastMileage={lastMileage} lastMileageMeta={lastMileageMeta} activeTrip={activeTrip} />
+      {appBgImage && (
+        <>
+          <img src={appBgImage} alt="" className="fixed inset-0 w-full h-full object-cover" />
+          <div className="fixed inset-0 bg-gradient-to-b from-slate-950/85 via-slate-950/45 to-slate-950/75" />
+        </>
+      )}
+
+      <div className="relative flex flex-col min-h-screen">
+        <Header lastMileage={lastMileage} lastMileageMeta={lastMileageMeta} activeTrip={activeTrip} />
 
       <main className="flex-1 overflow-y-auto pb-24 px-4 pt-4 no-scrollbar">
         {tab === "log" && (
@@ -351,11 +450,18 @@ export default function MileageLogger() {
             onRemoveLocation={(name) => persistLocations(locations.filter((l) => l.name !== name))}
             onPinLocation={(name, lat, lng) => upsertLocation(name, lat, lng)}
             trips={trips}
+            nodeRedUrl={nodeRedUrl}
+            nodeRedEnabled={nodeRedEnabled}
+            onNodeRedUrlChange={(url) => persistSettings({ nodeRedUrl: url })}
+            onNodeRedEnabledChange={(enabled) => persistSettings({ nodeRedEnabled: enabled })}
+            onTestPing={() => syncToNodeRed({ event: "test", message: "Hello from Mileage Logger" }, { force: true })}
+            onSyncAll={() => syncToNodeRed({ event: "full_sync", trips }, { force: true })}
           />
         )}
       </main>
 
       <BottomNav tab={tab} setTab={setTab} onQuickAdd={() => (activeTrip ? setShowEnd(true) : setShowStart(true))} activeTrip={activeTrip} />
+      </div>
 
       {showStart && (
         <StartTripModal
@@ -397,7 +503,7 @@ export default function MileageLogger() {
 
 function Header({ lastMileage, lastMileageMeta, activeTrip }) {
   return (
-    <div className="px-5 pt-6 pb-5 bg-gradient-to-b from-slate-900 to-slate-950 border-b border-slate-800">
+    <div className="px-5 pt-6 pb-5 border-b border-slate-800/60">
       <div className="flex items-center justify-between mb-3">
         <div className="flex flex-col gap-1">
           <img src="/logo.png" alt="Company logo" className="h-8 w-auto object-contain object-left" />
@@ -428,7 +534,7 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
   return (
     <div className="space-y-4">
       {activeTrip ? (
-        <div className="rounded-2xl bg-slate-900 border border-emerald-400/20 p-4">
+        <div className="rounded-2xl bg-slate-900/50 border border-emerald-400/20 p-4">
           <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold uppercase tracking-wide mb-3">
             <Clock size={14} /> Trip in progress
           </div>
@@ -462,12 +568,12 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
 
       <button
         onClick={onFull}
-        className="w-full py-3 rounded-xl bg-slate-900 border border-slate-800 text-slate-300 font-semibold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
+        className="w-full py-3 rounded-xl bg-slate-900/50 border border-slate-800/60 text-slate-300 font-semibold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
       >
         <Plus size={16} /> Log a completed trip
       </button>
 
-      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
         <div className="flex items-center justify-between mb-3">
           <span className="text-sm font-semibold text-slate-300">Recent trips</span>
           <button onClick={onViewAll} className="text-xs text-amber-400 font-medium flex items-center gap-0.5">
@@ -662,14 +768,14 @@ function SummaryTab({ trips }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <button onClick={() => setMonthOffset((m) => m - 1)} className="w-9 h-9 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center active:scale-95">
+        <button onClick={() => setMonthOffset((m) => m - 1)} className="w-9 h-9 rounded-full bg-slate-900/50 border border-slate-800/60 flex items-center justify-center active:scale-95">
           <ChevronLeft size={16} className="text-slate-400" />
         </button>
         <span className="font-semibold text-slate-200 text-sm">{monthLabel(ym)}</span>
         <button
           onClick={() => setMonthOffset((m) => Math.min(0, m + 1))}
           disabled={monthOffset >= 0}
-          className="w-9 h-9 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center active:scale-95 disabled:opacity-30"
+          className="w-9 h-9 rounded-full bg-slate-900/50 border border-slate-800/60 flex items-center justify-center active:scale-95 disabled:opacity-30"
         >
           <ChevronRight size={16} className="text-slate-400" />
         </button>
@@ -692,7 +798,7 @@ function SummaryTab({ trips }) {
       )}
 
       {clientRows.length > 0 && (
-        <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+        <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
           <div className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-1.5">
             <Receipt size={14} className="text-sky-400" /> Chargeable by client
           </div>
@@ -707,7 +813,7 @@ function SummaryTab({ trips }) {
         </div>
       )}
 
-      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
         <div className="flex items-center justify-between mb-1">
           <span className="text-sm font-semibold text-slate-300">Business use</span>
           <span className="font-odo text-sm text-amber-400 font-bold">{bizPct}%</span>
@@ -718,7 +824,7 @@ function SummaryTab({ trips }) {
       </div>
 
       {chartData.length > 0 && (
-        <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+        <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
           <div className="text-sm font-semibold text-slate-300 mb-3">Daily km</div>
           <div style={{ width: "100%", height: 160 }}>
             <ResponsiveContainer>
@@ -741,7 +847,7 @@ function SummaryTab({ trips }) {
       )}
 
       {monthSiteVisits.length > 0 && (
-        <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+        <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
           <div className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-1.5">
             <Clock size={14} className="text-amber-400" /> Time on site
           </div>
@@ -763,7 +869,7 @@ function SummaryTab({ trips }) {
         </div>
       )}
 
-      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 space-y-2">
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4 space-y-2">
         <div className="text-sm font-semibold text-slate-300 mb-1">Export for tax / reimbursement</div>
         <button onClick={() => exportCsv("all")} className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-200 text-sm font-medium flex items-center justify-center gap-2 active:scale-95">
           <Download size={14} /> All trips (CSV)
@@ -790,7 +896,7 @@ function StatCard({ label, value, sub, accent }) {
     accent === "slate" ? "text-slate-300" :
     "text-slate-100";
   return (
-    <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3">
+    <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-3">
       <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">{label}</div>
       <div className={`font-odo text-lg font-bold ${color}`}>{value}</div>
       <div className="text-xs text-slate-500">{sub}</div>
@@ -798,10 +904,16 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
-function SettingsTab({ locations, onAddLocation, onRemoveLocation, onPinLocation, trips }) {
+function SettingsTab({
+  locations, onAddLocation, onRemoveLocation, onPinLocation, trips,
+  nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
+}) {
   const [newLoc, setNewLoc] = useState("");
   const [pinningName, setPinningName] = useState(null);
   const [pinError, setPinError] = useState("");
+  const [urlDraft, setUrlDraft] = useState(nodeRedUrl);
+  const [pingStatus, setPingStatus] = useState(null); // null | "sending" | "ok" | "fail"
+  const [syncStatus, setSyncStatus] = useState(null);
 
   async function handlePin(name) {
     setPinningName(name);
@@ -815,9 +927,23 @@ function SettingsTab({ locations, onAddLocation, onRemoveLocation, onPinLocation
     setPinningName(null);
   }
 
+  async function handleTestPing() {
+    setPingStatus("sending");
+    const ok = await onTestPing();
+    setPingStatus(ok ? "ok" : "fail");
+    setTimeout(() => setPingStatus(null), 3000);
+  }
+
+  async function handleSyncAll() {
+    setSyncStatus("sending");
+    const ok = await onSyncAll();
+    setSyncStatus(ok ? "ok" : "fail");
+    setTimeout(() => setSyncStatus(null), 3000);
+  }
+
   return (
     <div className="space-y-4">
-      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
         <div className="text-sm font-semibold text-slate-300 mb-1">Saved locations</div>
         <div className="text-xs text-slate-500 mb-3">
           Locations with a pinned GPS spot get auto-matched when you use "Use current location" on a trip.
@@ -858,7 +984,61 @@ function SettingsTab({ locations, onAddLocation, onRemoveLocation, onPinLocation
         </div>
       </div>
 
-      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4">
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-sm font-semibold text-slate-300 flex items-center gap-1.5">
+            <Radio size={14} className="text-sky-400" /> Node-RED sync
+          </div>
+          <button
+            onClick={() => onNodeRedEnabledChange(!nodeRedEnabled)}
+            className={`w-11 h-6 rounded-full shrink-0 flex items-center px-0.5 transition-colors ${nodeRedEnabled ? "bg-emerald-500 justify-end" : "bg-slate-700 justify-start"}`}
+          >
+            <span className="w-5 h-5 rounded-full bg-white" />
+          </button>
+        </div>
+        <div className="text-xs text-slate-500 mb-3">
+          When enabled, every trip start/end/edit/delete gets POSTed as JSON to an HTTP-in node on your
+          flow — point it at whatever endpoint your Node-RED instance exposes. Runs best-effort in the
+          background; trips still save locally even if the webhook is unreachable.
+        </div>
+        <Field label="Webhook URL">
+          <input
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            onBlur={() => onNodeRedUrlChange(urlDraft)}
+            placeholder="http://192.168.1.50:1880/mileage"
+            className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-sky-400/50 font-mono"
+            inputMode="url"
+            autoCapitalize="none"
+            autoCorrect="off"
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-2 mt-1">
+          <button
+            onClick={handleTestPing}
+            disabled={!urlDraft.trim() || pingStatus === "sending"}
+            className="py-2.5 rounded-xl bg-slate-800 text-slate-200 text-sm font-medium flex items-center justify-center gap-2 active:scale-95 disabled:opacity-40"
+          >
+            <Send size={13} />
+            {pingStatus === "sending" ? "Sending…" : pingStatus === "ok" ? "Sent ✓" : pingStatus === "fail" ? "Failed" : "Send test ping"}
+          </button>
+          <button
+            onClick={handleSyncAll}
+            disabled={!urlDraft.trim() || syncStatus === "sending"}
+            className="py-2.5 rounded-xl bg-sky-400/10 border border-sky-400/30 text-sky-400 text-sm font-medium flex items-center justify-center gap-2 active:scale-95 disabled:opacity-40"
+          >
+            <Radio size={13} />
+            {syncStatus === "sending" ? "Syncing…" : syncStatus === "ok" ? "Synced ✓" : syncStatus === "fail" ? "Failed" : `Sync all ${trips.length}`}
+          </button>
+        </div>
+        {(pingStatus === "fail" || syncStatus === "fail") && (
+          <div className="text-rose-400 text-xs flex items-center gap-1.5 mt-2">
+            <AlertTriangle size={13} /> Couldn't reach that URL — check the address and that Node-RED's HTTP-in node allows requests from this browser (CORS).
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
         <div className="text-sm font-semibold text-slate-300 mb-1">Your data</div>
         <div className="text-xs text-slate-500 mb-3">
           {trips.length} trip{trips.length === 1 ? "" : "s"} stored, saved automatically as you go.
@@ -905,25 +1085,34 @@ function BottomNav({ tab, setTab, onQuickAdd, activeTrip }) {
   );
 }
 
-function Modal({ title, onClose, children, footer }) {
+function Modal({ title, onClose, children, footer, bgImage }) {
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60" onClick={onClose}>
       <div
-        className="w-full max-w-md bg-slate-900 rounded-t-3xl border-t border-slate-700 flex flex-col"
+        className="w-full max-w-md rounded-t-3xl border-t border-slate-700 relative overflow-hidden"
         style={{ maxHeight: "88vh" }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex justify-center pt-2.5">
-          <div className="w-9 h-1 rounded-full bg-slate-700" />
+        <div className="absolute inset-0 bg-slate-900" />
+        {bgImage && (
+          <>
+            <img src={bgImage} alt="" className="absolute inset-0 w-full h-full object-cover" />
+            <div className="absolute inset-0 bg-slate-950/70" />
+          </>
+        )}
+        <div className="relative flex flex-col" style={{ maxHeight: "88vh" }}>
+          <div className="flex justify-center pt-2.5">
+            <div className="w-9 h-1 rounded-full bg-slate-700" />
+          </div>
+          <div className="flex items-center justify-between px-5 pt-3 pb-2">
+            <span className="font-bold text-slate-100">{title}</span>
+            <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center">
+              <X size={15} className="text-slate-400" />
+            </button>
+          </div>
+          <div className="px-5 pb-3 overflow-y-auto no-scrollbar">{children}</div>
+          {footer && <div className="px-5 pb-6 pt-2 border-t border-slate-800">{footer}</div>}
         </div>
-        <div className="flex items-center justify-between px-5 pt-3 pb-2">
-          <span className="font-bold text-slate-100">{title}</span>
-          <button onClick={onClose} className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center">
-            <X size={15} className="text-slate-400" />
-          </button>
-        </div>
-        <div className="px-5 pb-3 overflow-y-auto no-scrollbar">{children}</div>
-        {footer && <div className="px-5 pb-6 pt-2 border-t border-slate-800">{footer}</div>}
       </div>
     </div>
   );
@@ -1094,6 +1283,7 @@ function StartTripModal({ locations, suggestedMileage, onClose, onSave }) {
     <Modal
       title="Start Trip"
       onClose={onClose}
+      bgImage={bgForCategory(category, businessType)}
       footer={
         <button onClick={submit} className="w-full py-3.5 rounded-xl bg-amber-400 text-slate-950 font-bold flex items-center justify-center gap-2">
           <Check size={16} /> Start Trip
@@ -1148,6 +1338,7 @@ function EndTripModal({ trip, locations, onClose, onSave }) {
     <Modal
       title="End Trip"
       onClose={onClose}
+      bgImage={bgForCategory(trip.category, trip.businessType)}
       footer={
         <div>
           {km !== null && km >= 0 && (
@@ -1226,6 +1417,7 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete }) {
     <Modal
       title={initial ? "Edit Trip" : "Log a Completed Trip"}
       onClose={onClose}
+      bgImage={bgForCategory(category, businessType)}
       footer={
         <div>
           {km !== null && (
