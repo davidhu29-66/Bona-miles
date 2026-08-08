@@ -1,13 +1,3 @@
-// Firebase project config comes from environment variables so the actual
-// keys aren't hardcoded into the source. Set these in a local `.env` file for
-// `npm run dev`, and in Vercel → Project → Settings → Environment Variables
-// for the deployed site. See .env.example for the full list.
-//
-// Note: the Firebase "apiKey" etc. below are not secret in the way a server
-// API key is — they identify your project to Google, and real security comes
-// from Firestore Security Rules (see firestore.rules) plus requiring sign-in.
-// It's still good practice to keep them out of source control via .env.
-
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
@@ -21,6 +11,21 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-export const db = getFirestore(app);
+export let auth = null;
+export let db = null;
+export let firebaseInitError = null;
+
+try {
+  const missing = Object.entries(firebaseConfig).filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) {
+    throw new Error(
+      `Missing Firebase config value(s): ${missing.join(", ")}. Check Vercel → Settings → ` +
+      `Environment Variables are saved correctly and that you Redeployed after adding them.`
+    );
+  }
+  const app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (err) {
+  firebaseInitError = err && err.message ? err.message : String(err);
+}
