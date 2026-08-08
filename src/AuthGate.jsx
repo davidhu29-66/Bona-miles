@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from "react";
 import {
   onAuthStateChanged,
@@ -9,7 +8,7 @@ import {
 import { auth, firebaseInitError } from "./firebaseClient.js";
 import MileageLogger from "./MileageLogger.jsx";
 
-if (typeof window !== "undefined") {
+if (typeof window !== "undefined" && auth) {
   window.appSignOut = () => signOut(auth);
 }
 
@@ -31,10 +30,14 @@ export default function AuthGate() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => onAuthStateChanged(auth, (u) => setUser(u)), []);
+  useEffect(() => {
+    if (!auth) return; // Firebase never initialized — nothing to subscribe to
+    return onAuthStateChanged(auth, (u) => setUser(u));
+  }, []);
 
   async function handleSubmit(e) {
     e.preventDefault();
+    if (!auth) return;
     setError("");
     setBusy(true);
     try {
@@ -48,16 +51,21 @@ export default function AuthGate() {
     }
     setBusy(false);
   }
-if (firebaseInitError) {
+
+  if (firebaseInitError) {
     return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center px-6" style={{ fontFamily: "'Manrope', sans-serif" }}>
+      <div
+        className="min-h-screen bg-slate-950 flex items-center justify-center px-6"
+        style={{ fontFamily: "'Manrope', sans-serif" }}
+      >
         <div className="w-full max-w-sm bg-slate-900 border border-rose-400/30 rounded-2xl p-6">
           <div className="text-rose-400 font-bold text-sm mb-2">Couldn't connect to Firebase</div>
           <div className="text-slate-300 text-xs leading-relaxed break-words">{firebaseInitError}</div>
         </div>
       </div>
     );
-}
+  }
+
   if (user === undefined) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
