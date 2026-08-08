@@ -1,0 +1,77 @@
+[
+    {
+        "id": "tab_mileage_demo",
+        "type": "tab",
+        "label": "Mileage Webhook Demo",
+        "disabled": false,
+        "info": "Demo/test flow for the Mileage Logger app's Node-RED sync feature.\n\nThe app POSTs here with Content-Type: text/plain (deliberately — see the app's README for why: it dodges CORS preflight, which Node-RED's core http-in node can't handle anyway since it has no OPTIONS method). The body is still a JSON string, so this flow parses it manually with JSON.parse.\n\nAfter deploying: in the app's Settings tab, set the webhook URL to https://<your-address>:1881/api/timesheet/submit and hit \"Send test ping\". Watch the debug sidebar (the bug icon, top right) for the incoming payload."
+    },
+    {
+        "id": "http_in_1",
+        "type": "http in",
+        "z": "tab_mileage_demo",
+        "name": "POST /api/timesheet/submit",
+        "url": "/api/timesheet/submit",
+        "method": "post",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 220,
+        "y": 160,
+        "wires": [
+            [
+                "fn_handle"
+            ]
+        ]
+    },
+    {
+        "id": "fn_handle",
+        "type": "function",
+        "z": "tab_mileage_demo",
+        "name": "Parse trip + build ack",
+        "func": "let parsed;\ntry {\n    parsed = JSON.parse(msg.payload);\n} catch (e) {\n    parsed = { error: \"Could not parse JSON body\", raw: msg.payload };\n}\n\n// Output 1: the HTTP response sent back to the app.\n// Access-Control-Allow-Origin is required even without a preflight —\n// simple requests still need it on the actual response, or the browser's\n// fetch() will reject reading the response even though Node-RED got it fine.\nconst ack = {\n    ...msg,\n    statusCode: 200,\n    headers: { \"Access-Control-Allow-Origin\": \"*\" },\n    payload: {\n        status: \"ok\",\n        event: parsed.event || null,\n        receivedAt: new Date().toISOString()\n    }\n};\n\n// Output 2: the parsed trip data, for the debug sidebar / further processing.\nconst debugMsg = { ...msg, payload: parsed };\n\nreturn [ack, debugMsg];",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 470,
+        "y": 160,
+        "wires": [
+            [
+                "http_response_1"
+            ],
+            [
+                "debug_1"
+            ]
+        ]
+    },
+    {
+        "id": "http_response_1",
+        "type": "http response",
+        "z": "tab_mileage_demo",
+        "name": "Ack response",
+        "statusCode": "",
+        "headers": {},
+        "x": 730,
+        "y": 120,
+        "wires": []
+    },
+    {
+        "id": "debug_1",
+        "type": "debug",
+        "z": "tab_mileage_demo",
+        "name": "Trip payload",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 710,
+        "y": 200,
+        "wires": []
+    }
+]

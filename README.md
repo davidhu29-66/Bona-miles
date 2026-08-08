@@ -38,6 +38,33 @@ Push to GitHub, let Vercel redeploy. Open the site — you'll land on a sign-in 
 Create an account"** to set your own email + password. That's your login going forward; there's no
 separate signup process needed.
 
+## Background art
+
+The whole app's background reflects where you actually are right now, derived from your trip
+data — not just a decoration on one screen:
+
+- **A trip is active** (Start Trip done, no End Trip yet) → shows that trip's "mileage" art:
+  `admin-mileage.jpg`, `charge-mileage.jpg`, or `pvt-mileage.jpg`.
+- **No trip active** → shows "at rest" art based on the most recently completed trip's category:
+  `admin-time.jpg` or `pvt-time.jpg`. Chargeable trips use `time-onsite.jpg` for this state (there's
+  no separate "charge-time" asset — client site time uses the generic Time on site art instead).
+- Start Trip / Log a Trip modals also live-preview the mileage art as you toggle category, before
+  you've even saved. End Trip carries whatever art the trip started with.
+
+A scrim sits over the art so text stays readable — lighter behind the header and card gaps
+(that's where the art gets to be bold), heavier where it matters (page edges, the odometer number).
+Actual data — trip rows, stat cards, form fields — sits on its own solid card background regardless
+of what's showing behind it, so none of that changed.
+
+Images live in `public/backgrounds/` (six JPGs, filenames above) — swap them to restyle. The
+mapping logic is `bgForCategory()` (moving) and `bgForCategoryAtRest()` (arrived) near the top of
+`MileageLogger.jsx`; the app-wide pick itself is the `appBgImage` value inside the main component.
+
+**Note on Time on site:** private-category arrivals (home, personal stops) no longer count toward
+the Time on site list, summary, or CSV export — that feature is for job/billing time, not personal
+time. The background still shows `pvt-time.jpg` while you're at home, it just doesn't get logged as
+site time.
+
 ## Running it like a native app on your phone
 
 I can't compile an actual `.apk` myself — that needs the Android SDK/build tools, which aren't
@@ -70,6 +97,62 @@ Business trips now split further into **Admin** (non-client work, e.g. commuting
 (billable to a client, with an optional client name field). Summary tab shows the breakdown and lets
 you export a chargeable-only CSV for client invoicing. Trips saved before this update show as
 "Admin" by default until you edit them — nothing is silently reclassified as billable.
+
+## Node-RED sync (new)
+
+Settings tab now has a "Node-RED sync" toggle. When on, every trip start/end/edit/delete gets
+POSTed as JSON to a webhook URL you enter (e.g. `http://192.168.1.50:1880/mileage`) — point it at
+an HTTP-in node on any flow. There's also a "Send test ping" button and a "Sync all" button to
+push every stored trip at once (handy for backfilling a new flow, or after re-connecting to a site
+that was offline). It's fire-and-forget: a failed or unreachable webhook never blocks or breaks
+trip saving locally.
+
+**Node-RED side setup:** you need an `http in` node (method POST, whatever path you choose) → your
+processing → an `http response` node, wired to send back a 200. On that response node's message,
+set:
+
+```js
+msg.headers = { "Access-Control-Allow-Origin": "*" };
+```
+
+The app deliberately sends the request with `Content-Type: text/plain` (the body is still a JSON
+string — Node-RED just won't auto-parse it, so your flow needs `JSON.parse(msg.payload)`). This is
+to dodge CORS preflight: `application/json` counts as a "non-simple" content type, which triggers a
+browser-sent `OPTIONS` preflight request before the real POST — and Node-RED's core `http in` node
+has no way to register an OPTIONS route at all, so that preflight always 404s and the browser
+blocks everything before it reaches your flow. `text/plain` is CORS-"simple" and skips preflight
+entirely, so this works with zero Node-RED server config beyond the flow itself.
+
+If you'd rather use `application/json` properly (e.g. because some other client also posts here and
+expects that), the only real fix is the global setting, which handles preflight for you — on Venus
+OS Large the file is `/data/home/nodered/.node-red/settings-user.js` (create it if missing, and
+wrap the contents in `module.exports = { ... }` — this is Victron's override file and survives
+firmware updates, unlike the generic Node-RED `settings.js` path):
+
+```js
+module.exports = {
+    httpNodeCors: {
+        origin: "*",
+        methods: "GET,PUT,POST,DELETE"
+    },
+}
+```
+
+Payload shapes sent (event field always present):
+- `{ event: "trip_started", trip, sentAt }`
+- `{ event: "trip_completed", trip, sentAt }` — fired when End Trip or the full-trip form completes a new trip
+- `{ event: "trip_updated", trip, sentAt }` — editing an existing trip from History
+- `{ event: "trip_deleted", tripId, sentAt }`
+- `{ event: "test", message, sentAt }` — the test ping button
+- `{ event: "full_sync", trips, sentAt }` — the sync-all button, `trips` is the full array
+
+`trip` objects carry: `id, date, timeOut, mileageOut, fromLocation, timeIn, mileageIn, toLocation,
+category, businessType, client, purpose, jobNumber, siteNotes`.
+
+A ready-to-import demo flow (`node-red-demo-flow.json`) is included alongside this README —
+Node-RED menu → Import → paste the file contents → Deploy. It parses the incoming trip, sets the
+CORS header, echoes an ack back to the app, and logs each trip to the debug sidebar so you can
+watch them arrive in real time.
 
 ## Time on site (new)
 
