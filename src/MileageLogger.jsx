@@ -147,6 +147,9 @@ export default function MileageLogger() {
   const [loading, setLoading] = useState(true);
   const [trips, setTrips] = useState([]);
   const [locations, setLocations] = useState(DEFAULT_LOCATIONS);
+  const [clients, setClients] = useState([]);
+  const [workSessions, setWorkSessions] = useState([]);
+  const [activeTimer, setActiveTimer] = useState(null);
   const [nodeRedUrl, setNodeRedUrl] = useState("");
   const [nodeRedEnabled, setNodeRedEnabled] = useState(false);
   const [tab, setTab] = useState("log");
@@ -154,15 +157,18 @@ export default function MileageLogger() {
 
   const [showStart, setShowStart] = useState(false);
   const [showEnd, setShowEnd] = useState(false);
+  const [showTimeOn, setShowTimeOn] = useState(false);
   const [showFull, setShowFull] = useState(false);
   const [editingTrip, setEditingTrip] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
 
   useEffect(() => {
     (async () => {
+      let loadedTrips = [];
       try {
         const res = await window.storage.get("trips", false);
-        setTrips(res ? JSON.parse(res.value) : []);
+        loadedTrips = res ? JSON.parse(res.value) : [];
+        setTrips(loadedTrips);
       } catch (e) {
         setTrips([]);
       }
@@ -174,6 +180,42 @@ export default function MileageLogger() {
         setLocations(migrated);
       } catch (e) {
         setLocations(DEFAULT_LOCATIONS);
+      }
+      try {
+        const res = await window.storage.get("clients", false);
+        const loadedClients = res ? JSON.parse(res.value) : [];
+        if (loadedClients.length === 0 && loadedTrips.length > 0) {
+          // One-time migration: this list used to be free-text per trip.
+          // Seed it from whatever client names already appear in history so
+          // nothing "disappears" the first time this list is used.
+          const seen = new Set();
+          const seeded = [];
+          for (const t of loadedTrips) {
+            const name = t.client && t.client.trim();
+            if (name && !seen.has(name.toLowerCase())) {
+              seen.add(name.toLowerCase());
+              seeded.push(name);
+            }
+          }
+          setClients(seeded);
+          if (seeded.length) await window.storage.set("clients", JSON.stringify(seeded), false);
+        } else {
+          setClients(loadedClients);
+        }
+      } catch (e) {
+        setClients([]);
+      }
+      try {
+        const res = await window.storage.get("workSessions", false);
+        setWorkSessions(res ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setWorkSessions([]);
+      }
+      try {
+        const res = await window.storage.get("activeTimer", false);
+        setActiveTimer(res ? JSON.parse(res.value) : null);
+      } catch (e) {
+        setActiveTimer(null);
       }
       try {
         const res = await window.storage.get("settings", false);
@@ -208,6 +250,77 @@ export default function MileageLogger() {
     } catch (e) {
       showToast("error", "Couldn't save that location.");
     }
+  }
+
+  async function persistClients(next) {
+    setClients(next);
+    try {
+      await window.storage.set("clients", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that client.");
+    }
+  }
+
+  function upsertClient(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (clients.some((c) => c.toLowerCase() === trimmed.toLowerCase())) return;
+    persistClients([...clients, trimmed]);
+  }
+
+  async function persistWorkSessions(next) {
+    setWorkSessions(next);
+    try {
+      await window.storage.set("workSessions", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that work session.");
+    }
+  }
+
+  async function persistActiveTimer(next) {
+    setActiveTimer(next);
+    try {
+      if (next) {
+        await window.storage.set("activeTimer", JSON.stringify(next), false);
+      } else {
+        await window.storage.delete("activeTimer", false);
+      }
+    } catch (e) {
+      showToast("error", "Couldn't save timer state.");
+    }
+  }
+
+  // Explicit time-tracking, separate from trip logging. Exists specifically
+  // because inferring "how long was I actually working this job" from trip
+  // legs and dwell-time proved unreliable (see timesheetLogic.js) — this is
+  // the unambiguous alternative: you say when it starts and stops.
+  function timeOn(data) {
+    if (activeTimer) return; // one job at a time
+    const timer = {
+      id: uid(),
+      onDate: todayStr(),
+      onTime: nowTimeStr(),
+      category: data.category,
+      businessType: data.category === "business" ? data.businessType : null,
+      client: data.category === "business" && data.businessType === "chargeable" ? (data.client || "") : "",
+      jobNumber: data.jobNumber || "",
+    };
+    persistActiveTimer(timer);
+    showToast("success", `Time on — ${timer.businessType === "chargeable" ? timer.client || "Chargeable" : "Admin"}.`);
+    syncToNodeRed({ event: "time_on", timer });
+  }
+
+  function timeOff() {
+    if (!activeTimer) return;
+    const session = {
+      ...activeTimer,
+      offDate: todayStr(),
+      offTime: nowTimeStr(),
+    };
+    persistWorkSessions([...workSessions, session]);
+    persistActiveTimer(null);
+    showToast("success", "Time off — session logged.");
+    syncToNodeRed({ event: "time_off", session });
   }
 
   async function persistSettings(next) {
@@ -437,6 +550,9 @@ export default function MileageLogger() {
             onFull={() => { setEditingTrip(null); setShowFull(true); }}
             onViewAll={() => setTab("history")}
             onEditTrip={(t) => setEditingTrip(t)}
+            activeTimer={activeTimer}
+            onTimeOn={() => setShowTimeOn(true)}
+            onTimeOff={timeOff}
           />
         )}
         {tab === "history" && (
@@ -456,6 +572,9 @@ export default function MileageLogger() {
             onNodeRedEnabledChange={(enabled) => persistSettings({ nodeRedEnabled: enabled })}
             onTestPing={() => syncToNodeRed({ event: "test", message: "Hello from Mileage Logger" }, { force: true })}
             onSyncAll={() => syncToNodeRed({ event: "full_sync", trips }, { force: true })}
+            clients={clients}
+            onAddClient={upsertClient}
+            onRemoveClient={(name) => persistClients(clients.filter((c) => c !== name))}
           />
         )}
       </main>
@@ -469,6 +588,8 @@ export default function MileageLogger() {
           suggestedMileage={lastMileage}
           onClose={() => setShowStart(false)}
           onSave={startTrip}
+          clients={clients}
+          onAddClient={upsertClient}
         />
       )}
       {showEnd && activeTrip && (
@@ -479,6 +600,14 @@ export default function MileageLogger() {
           onSave={(data) => endTrip(activeTrip.id, data)}
         />
       )}
+      {showTimeOn && (
+        <TimeOnModal
+          clients={clients}
+          onAddClient={upsertClient}
+          onClose={() => setShowTimeOn(false)}
+          onStart={(data) => { timeOn(data); setShowTimeOn(false); }}
+        />
+      )}
       {(showFull || editingTrip) && (
         <FullTripModal
           locations={locations}
@@ -486,6 +615,8 @@ export default function MileageLogger() {
           onClose={() => { setShowFull(false); setEditingTrip(null); }}
           onSave={(data) => saveFullTrip(data, editingTrip ? editingTrip.id : null)}
           onDelete={editingTrip ? () => setConfirmDelete(editingTrip.id) : null}
+          clients={clients}
+          onAddClient={upsertClient}
         />
       )}
       {confirmDelete && (
@@ -530,7 +661,7 @@ function Header({ lastMileage, lastMileageMeta, activeTrip }) {
   );
 }
 
-function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, onEditTrip }) {
+function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, onEditTrip, activeTimer, onTimeOn, onTimeOff }) {
   return (
     <div className="space-y-4">
       {activeTrip ? (
@@ -566,6 +697,39 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
         </button>
       )}
 
+      {activeTimer ? (
+        <div className="rounded-2xl bg-slate-900/50 border border-sky-400/20 p-4">
+          <div className="flex items-center gap-2 text-sky-400 text-xs font-semibold uppercase tracking-wide mb-3">
+            <Clock size={14} /> Job timer running
+          </div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-slate-400 text-sm">
+              {activeTimer.businessType === "chargeable" ? (activeTimer.client || "Chargeable") : "Admin"}
+            </span>
+            {activeTimer.jobNumber && <span className="text-slate-500 text-xs">Job #{activeTimer.jobNumber}</span>}
+          </div>
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-slate-400 text-sm">Elapsed</span>
+            <span className="font-odo text-lg text-sky-400">
+              <ElapsedTime sinceDate={activeTimer.onDate} sinceTime={activeTimer.onTime} />
+            </span>
+          </div>
+          <button
+            onClick={onTimeOff}
+            className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
+          >
+            Time Off
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onTimeOn}
+          className="w-full py-3.5 rounded-xl bg-slate-900/50 border border-sky-400/30 text-sky-400 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
+        >
+          <Clock size={18} /> Time On
+        </button>
+      )}
+
       <button
         onClick={onFull}
         className="w-full py-3 rounded-xl bg-slate-900/50 border border-slate-800/60 text-slate-300 font-semibold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
@@ -595,6 +759,19 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
       </div>
     </div>
   );
+}
+
+function ElapsedTime({ sinceDate, sinceTime }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const start = new Date(`${sinceDate}T${sinceTime}`).getTime();
+  const diffMin = Math.max(0, Math.floor((now - start) / 60000));
+  const h = Math.floor(diffMin / 60);
+  const m = diffMin % 60;
+  return <span>{h}h {String(m).padStart(2, "0")}m</span>;
 }
 
 function TripRow({ trip, onClick, compact }) {
@@ -907,8 +1084,10 @@ function StatCard({ label, value, sub, accent }) {
 function SettingsTab({
   locations, onAddLocation, onRemoveLocation, onPinLocation, trips,
   nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
+  clients, onAddClient, onRemoveClient,
 }) {
   const [newLoc, setNewLoc] = useState("");
+  const [newClient, setNewClient] = useState("");
   const [pinningName, setPinningName] = useState(null);
   const [pinError, setPinError] = useState("");
   const [urlDraft, setUrlDraft] = useState(nodeRedUrl);
@@ -977,6 +1156,43 @@ function SettingsTab({
           />
           <button
             onClick={() => { if (newLoc.trim()) { onAddLocation(newLoc.trim()); setNewLoc(""); } }}
+            className="px-4 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm"
+          >
+            Add
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="text-sm font-semibold text-slate-300 mb-1">Chargeable clients</div>
+        <div className="text-xs text-slate-500 mb-3">
+          This exact list is what you pick from when logging a Chargeable trip — keep names
+          consistent here so timesheet/billing exports always match up.
+        </div>
+        <div className="flex flex-col gap-2 mb-3">
+          {clients.length === 0 && (
+            <div className="text-xs text-slate-600 italic">No clients yet — add your first one below.</div>
+          )}
+          {clients.map((c) => (
+            <div key={c} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-800">
+              <Receipt size={14} className="text-sky-400 shrink-0" />
+              <span className="flex-1 text-sm text-slate-200">{c}</span>
+              <button onClick={() => onRemoveClient(c)}><X size={13} className="text-slate-500" /></button>
+            </div>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input
+            value={newClient}
+            onChange={(e) => setNewClient(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newClient.trim()) { onAddClient(newClient.trim()); setNewClient(""); }
+            }}
+            placeholder="Add a client (e.g. SBSA Caledon)"
+            className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-amber-400/50"
+          />
+          <button
+            onClick={() => { if (newClient.trim()) { onAddClient(newClient.trim()); setNewClient(""); } }}
             className="px-4 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm"
           >
             Add
@@ -1208,7 +1424,19 @@ function LocateButton({ locations, onMatch, onNoMatch }) {
   );
 }
 
-function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, client, onClientChange }) {
+function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, client, onClientChange, clients, onAddClient }) {
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    onClientChange(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
   return (
     <div>
       <div className="flex gap-2">
@@ -1242,13 +1470,42 @@ function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, c
               <Receipt size={12} /> Chargeable
             </button>
           </div>
-          {businessType === "chargeable" && (
-            <input
-              value={client}
-              onChange={(e) => onClientChange(e.target.value)}
-              placeholder="Client name (optional)"
+          {businessType === "chargeable" && !addingNew && (
+            <select
+              value={clients.includes(client) ? client : ""}
+              onChange={(e) => {
+                if (e.target.value === "__add_new__") {
+                  setAddingNew(true);
+                } else {
+                  onClientChange(e.target.value);
+                }
+              }}
               className={`${inputClsPlain} mt-2`}
-            />
+            >
+              <option value="">Select client…</option>
+              {clients.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+              <option value="__add_new__">+ Add new client…</option>
+            </select>
+          )}
+          {businessType === "chargeable" && addingNew && (
+            <div className="flex gap-2 mt-2">
+              <input
+                autoFocus
+                value={newClientName}
+                onChange={(e) => setNewClientName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+                placeholder="New client name"
+                className={inputClsPlain}
+              />
+              <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">
+                Add
+              </button>
+              <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0">
+                <X size={16} />
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -1256,7 +1513,7 @@ function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, c
   );
 }
 
-function StartTripModal({ locations, suggestedMileage, onClose, onSave }) {
+function StartTripModal({ locations, suggestedMileage, onClose, onSave, clients, onAddClient }) {
   const [date, setDate] = useState(todayStr());
   const [timeOut, setTimeOut] = useState(nowTimeStr());
   const [mileageOut, setMileageOut] = useState(suggestedMileage !== null ? String(suggestedMileage) : "");
@@ -1306,6 +1563,7 @@ function StartTripModal({ locations, suggestedMileage, onClose, onSave }) {
           value={category} onChange={setCategory}
           businessType={businessType} onBusinessTypeChange={setBusinessType}
           client={client} onClientChange={setClient}
+          clients={clients} onAddClient={onAddClient}
         />
       </Field>
       <Field label="Purpose (optional)"><input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Site inspection" className={inputClsPlain} /></Field>
@@ -1377,7 +1635,101 @@ function EndTripModal({ trip, locations, onClose, onSave }) {
   );
 }
 
-function FullTripModal({ locations, initial, onClose, onSave, onDelete }) {
+function TimeOnModal({ clients, onAddClient, onClose, onStart }) {
+  const [businessType, setBusinessType] = useState("chargeable");
+  const [client, setClient] = useState("");
+  const [jobNumber, setJobNumber] = useState("");
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [error, setError] = useState("");
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    setClient(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
+  function submit() {
+    if (businessType === "chargeable" && !client) return setError("Pick a client, or add a new one.");
+    setError("");
+    onStart({ category: "business", businessType, client, jobNumber });
+  }
+
+  return (
+    <Modal
+      title="Time On"
+      onClose={onClose}
+      footer={
+        <button onClick={submit} className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold text-sm active:scale-95 transition-transform">
+          Start timer
+        </button>
+      }
+    >
+      <Field label="Type">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setBusinessType("admin")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            Admin
+          </button>
+          <button
+            onClick={() => setBusinessType("chargeable")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            <Receipt size={14} /> Chargeable
+          </button>
+        </div>
+      </Field>
+      {businessType === "chargeable" && !addingNew && (
+        <Field label="Client">
+          <select
+            value={clients.includes(client) ? client : ""}
+            onChange={(e) => {
+              if (e.target.value === "__add_new__") setAddingNew(true);
+              else setClient(e.target.value);
+            }}
+            className={inputClsPlain}
+          >
+            <option value="">Select client…</option>
+            {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__add_new__">+ Add new client…</option>
+          </select>
+        </Field>
+      )}
+      {businessType === "chargeable" && addingNew && (
+        <Field label="New client">
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={newClientName}
+              onChange={(e) => setNewClientName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+              placeholder="Client name"
+              className={inputClsPlain}
+            />
+            <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
+            <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
+          </div>
+        </Field>
+      )}
+      <Field label="Job number (optional)">
+        <input
+          value={jobNumber}
+          onChange={(e) => setJobNumber(e.target.value)}
+          placeholder="e.g. 4521 — leave blank if not generated yet"
+          className={inputClsPlain}
+        />
+      </Field>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients, onAddClient }) {
   const [date, setDate] = useState(initial?.date || todayStr());
   const [timeOut, setTimeOut] = useState(initial?.timeOut || nowTimeStr());
   const [mileageOut, setMileageOut] = useState(initial ? String(initial.mileageOut) : "");
@@ -1465,6 +1817,7 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete }) {
           value={category} onChange={setCategory}
           businessType={businessType} onBusinessTypeChange={setBusinessType}
           client={client} onClientChange={setClient}
+          clients={clients} onAddClient={onAddClient}
         />
       </Field>
       <Field label="Purpose (optional)"><input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Site inspection" className={inputClsPlain} /></Field>
