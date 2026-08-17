@@ -3,11 +3,13 @@ import {
   Gauge, Clock, Plus, X, Trash2, Settings as SettingsIcon,
   List, BarChart3, ChevronLeft, ChevronRight, Briefcase, Home as HomeIcon,
   Download, ArrowRight, AlertTriangle, Check, Car, LocateFixed, MapPin, Receipt,
-  Radio, Send,
+  Radio, Send, FileSpreadsheet,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
 } from "recharts";
+import { generateTimesheetBlob, lastWeekAnchor } from "./generateTimesheet.js";
+import { weekRange } from "./timesheetLogic.js";
 
 const DEFAULT_LOCATIONS = [{ name: "Home", lat: null, lng: null }, { name: "Office", lat: null, lng: null }];
 const GPS_MATCH_RADIUS_M = 200;
@@ -152,6 +154,8 @@ export default function MileageLogger() {
   const [activeTimer, setActiveTimer] = useState(null);
   const [nodeRedUrl, setNodeRedUrl] = useState("");
   const [nodeRedEnabled, setNodeRedEnabled] = useState(false);
+  const [timesheetName, setTimesheetName] = useState("");
+  const [timesheetRegion, setTimesheetRegion] = useState("");
   const [tab, setTab] = useState("log");
   const [toast, setToast] = useState(null);
 
@@ -222,6 +226,8 @@ export default function MileageLogger() {
         const s = res ? JSON.parse(res.value) : {};
         setNodeRedUrl(s.nodeRedUrl || "");
         setNodeRedEnabled(!!s.nodeRedEnabled);
+        setTimesheetName(s.timesheetName || "");
+        setTimesheetRegion(s.timesheetRegion || "");
       } catch (e) {
         // no settings saved yet — defaults are fine
       }
@@ -323,10 +329,40 @@ export default function MileageLogger() {
     syncToNodeRed({ event: "time_off", session });
   }
 
+  const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
+
+  async function handleGenerateTimesheet() {
+    setGeneratingTimesheet(true);
+    try {
+      const anchor = lastWeekAnchor();
+      const { blob, overflowClients, weekDays } = await generateTimesheetBlob(
+        trips, workSessions, anchor, { name: timesheetName, region: timesheetRegion }
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Timesheet_${weekDays[0]}_to_${weekDays[6]}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      if (overflowClients.length > 0) {
+        showToast("error", `${overflowClients.length} client/job pair(s) didn't fit the template's 9 columns — check the sheet.`);
+      } else {
+        showToast("success", `Timesheet generated: ${weekDays[0]} to ${weekDays[6]}.`);
+      }
+    } catch (e) {
+      showToast("error", "Couldn't generate the timesheet — " + (e.message || "unknown error"));
+    }
+    setGeneratingTimesheet(false);
+  }
+
   async function persistSettings(next) {
-    const merged = { nodeRedUrl, nodeRedEnabled, ...next };
+    const merged = { nodeRedUrl, nodeRedEnabled, timesheetName, timesheetRegion, ...next };
     if ("nodeRedUrl" in next) setNodeRedUrl(next.nodeRedUrl);
     if ("nodeRedEnabled" in next) setNodeRedEnabled(next.nodeRedEnabled);
+    if ("timesheetName" in next) setTimesheetName(next.timesheetName);
+    if ("timesheetRegion" in next) setTimesheetRegion(next.timesheetRegion);
     try {
       await window.storage.set("settings", JSON.stringify(merged), false);
     } catch (e) {
@@ -575,6 +611,12 @@ export default function MileageLogger() {
             clients={clients}
             onAddClient={upsertClient}
             onRemoveClient={(name) => persistClients(clients.filter((c) => c !== name))}
+            timesheetName={timesheetName}
+            timesheetRegion={timesheetRegion}
+            onTimesheetNameChange={(v) => persistSettings({ timesheetName: v })}
+            onTimesheetRegionChange={(v) => persistSettings({ timesheetRegion: v })}
+            onGenerateTimesheet={handleGenerateTimesheet}
+            generatingTimesheet={generatingTimesheet}
           />
         )}
       </main>
@@ -1085,6 +1127,8 @@ function SettingsTab({
   locations, onAddLocation, onRemoveLocation, onPinLocation, trips,
   nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
   clients, onAddClient, onRemoveClient,
+  timesheetName, timesheetRegion, onTimesheetNameChange, onTimesheetRegionChange,
+  onGenerateTimesheet, generatingTimesheet,
 }) {
   const [newLoc, setNewLoc] = useState("");
   const [newClient, setNewClient] = useState("");
@@ -1093,6 +1137,8 @@ function SettingsTab({
   const [urlDraft, setUrlDraft] = useState(nodeRedUrl);
   const [pingStatus, setPingStatus] = useState(null); // null | "sending" | "ok" | "fail"
   const [syncStatus, setSyncStatus] = useState(null);
+  const [nameDraft, setNameDraft] = useState(timesheetName);
+  const [regionDraft, setRegionDraft] = useState(timesheetRegion);
 
   async function handlePin(name) {
     setPinningName(name);
@@ -1198,6 +1244,42 @@ function SettingsTab({
             Add
           </button>
         </div>
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="text-sm font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+          <FileSpreadsheet size={14} className="text-emerald-400" /> Weekly timesheet
+        </div>
+        <div className="text-xs text-slate-500 mb-3">
+          Fills the HR-018 template from your logged trips and Time On/Off sessions — every
+          formula, merged cell, and format stays exactly as the template defines it. Always
+          generates last week (Monday–Sunday), whatever day it is when you tap it.
+        </div>
+        <Field label="Your name">
+          <input
+            value={nameDraft}
+            onChange={(e) => setNameDraft(e.target.value)}
+            onBlur={() => onTimesheetNameChange(nameDraft)}
+            placeholder="e.g. David Hughes"
+            className={inputClsPlain}
+          />
+        </Field>
+        <Field label="Region">
+          <input
+            value={regionDraft}
+            onChange={(e) => setRegionDraft(e.target.value)}
+            onBlur={() => onTimesheetRegionChange(regionDraft)}
+            placeholder="e.g. Western Cape"
+            className={inputClsPlain}
+          />
+        </Field>
+        <button
+          onClick={onGenerateTimesheet}
+          disabled={generatingTimesheet}
+          className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform disabled:opacity-50 mt-1"
+        >
+          <FileSpreadsheet size={16} /> {generatingTimesheet ? "Generating…" : "Generate last week's timesheet"}
+        </button>
       </div>
 
       <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
