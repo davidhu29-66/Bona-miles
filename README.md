@@ -38,6 +38,16 @@ Push to GitHub, let Vercel redeploy. Open the site — you'll land on a sign-in 
 Create an account"** to set your own email + password. That's your login going forward; there's no
 separate signup process needed.
 
+## Chargeable clients
+
+Settings → Chargeable clients manages the fixed list you pick from when logging a Chargeable
+trip — replaces the old free-text field. Keeping this as a managed list (not typed each time)
+means client names stay consistent for anything downstream that groups by client, like timesheet
+exports. Add/remove clients any time; the picker in Start Trip / Log a Trip always reflects the
+current list. Existing trips with a client name typed under the old free-text field are
+auto-migrated into this list the first time the app loads after updating — nothing is lost, and
+old trips keep whatever client they already had even if you later remove that name from the list.
+
 ## Background art
 
 The whole app's background reflects where you actually are right now, derived from your trip
@@ -97,6 +107,33 @@ Business trips now split further into **Admin** (non-client work, e.g. commuting
 (billable to a client, with an optional client name field). Summary tab shows the breakdown and lets
 you export a chargeable-only CSV for client invoicing. Trips saved before this update show as
 "Admin" by default until you edit them — nothing is silently reclassified as billable.
+
+## Weekly timesheet (new)
+
+Settings → Weekly timesheet: set your name/region once, then tap "Generate last week's timesheet"
+any time — always resolves to the most recent complete Monday–Sunday, whatever day it is when you
+tap it. Fills the HR-018 template entirely client-side (fetches the blank template from
+`public/templates/timesheet-template.xlsx`, writes values into it via ExcelJS, triggers a browser
+download) — no server, no Firebase service account, no cron job. Every formula, merged cell, and
+number format in the template is preserved exactly; only the actual data cells get written.
+
+**How the numbers are sourced:**
+- **KM** per client/job per day — from trip odometer readings (`mileageIn - mileageOut`)
+- **HRS** per client/job per day — from Time On/Off sessions only, *not* inferred from trip
+  durations or dwell time. That was tried and found unreliable (a return leg tagged to a job made
+  an unrelated later gap, e.g. back at the office, look like it belonged to that job too). Time
+  On/Off removes the guesswork — the session's own duration is the hours, full stop.
+- **Columns** — Admin is fixed (column B/C). Every other column is a (client, job number) pair,
+  assigned in order of first appearance that week, sourced from both trips and sessions combined.
+  A client with two different job numbers in the same week gets two separate columns, not one
+  merged/ambiguous one. The template has 9 dynamic slots; a week with more than 9 distinct
+  client/job pairs will flag an "overflow" toast naming what didn't fit.
+- **Opening/Closing KM's** — min/max odometer reading across the week's trips.
+- **PVTE (private km)** — summed automatically from private-category trips.
+
+This generates a *draft* for you to review before sending to HR — nothing is emailed
+automatically. `ExcelJS` is lazy-loaded (only fetched when you actually tap Generate), so it
+doesn't add to the app's normal load time.
 
 ## Node-RED sync (new)
 
