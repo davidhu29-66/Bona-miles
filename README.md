@@ -108,6 +108,15 @@ Business trips now split further into **Admin** (non-client work, e.g. commuting
 you export a chargeable-only CSV for client invoicing. Trips saved before this update show as
 "Admin" by default until you edit them — nothing is silently reclassified as billable.
 
+## Backfilling a work session
+
+History now interleaves trips and work sessions chronologically (not two separate lists), and has
+a "Log a work session" button at the top — the manual counterpart to Time On/Off, for a job you
+did but couldn't or forgot to toggle live. Same fields either way (on/off date+time, Admin or
+Chargeable+client+job#), so the weekly timesheet generator treats a backfilled session identically
+to a live-toggled one — no special-casing needed. Tap any session row in History to edit or delete
+it, same as trips.
+
 ## Weekly timesheet (new)
 
 Settings → Weekly timesheet: set your name/region once, then tap "Generate last week's timesheet"
