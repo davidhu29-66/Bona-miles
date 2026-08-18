@@ -25,7 +25,7 @@ export async function generateTimesheetBlob(allTrips, allSessions, weekAnchorDat
 
   ws.getCell("B1").value = name || "";
   ws.getCell("K1").value = region || "";
-  ws.getCell("W1").value = new Date(`${weekDays[6]}T00:00:00`); // week ending = Sunday
+  ws.getCell("W1").value = new Date(`${weekDays[6]}T00:00:00Z`); // week ending = Sunday, explicit UTC
 
   columns.forEach((col, i) => {
     ws.getCell(`${HRS_COLS[i]}2`).value = col.client;
@@ -53,7 +53,7 @@ export async function generateTimesheetBlob(allTrips, allSessions, weekAnchorDat
       cellKm.value = km > 0 ? Math.round(km) : null;
     });
     ws.getCell(`AA${row}`).value = dayData.pvte > 0 ? Math.round(dayData.pvte) : null;
-    ws.getCell(`A${row + 1}`).value = new Date(`${day}T00:00:00`);
+    ws.getCell(`A${row + 1}`).value = new Date(`${day}T00:00:00Z`);
     ws.getCell(`A${row + 1}`).numFmt = "dd-mm";
   });
 
@@ -69,9 +69,15 @@ export async function generateTimesheetBlob(allTrips, allSessions, weekAnchorDat
 
 // Anchor date (YYYY-MM-DD) for "last week" relative to today — the Monday
 // through Sunday immediately before the current one, regardless of what day
-// today happens to be.
+// today happens to be. Reads "today" via local getters (so it matches the
+// calendar day the person is actually on) then does the subtraction in UTC
+// space, avoiding the same local/UTC mixing bug fixed in weekRange() above.
 export function lastWeekAnchor() {
-  const d = new Date();
-  d.setDate(d.getDate() - 7);
-  return d.toISOString().slice(0, 10);
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const d = now.getDate();
+  const dt = new Date(Date.UTC(y, m, d));
+  dt.setUTCDate(dt.getUTCDate() - 7);
+  return dt.toISOString().slice(0, 10);
 }

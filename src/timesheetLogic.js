@@ -15,17 +15,23 @@ function sortKey(t) {
 }
 
 // Returns [mon, tue, wed, thu, fri, sat, sun] as YYYY-MM-DD strings for the
-// week containing anyDateStr.
+// week containing anyDateStr. Uses UTC throughout deliberately — mixing
+// local-time Date construction with toISOString() (always UTC) causes a
+// timezone-dependent off-by-one-day bug in any timezone ahead of UTC (e.g.
+// SAST, UTC+2): local midnight becomes 22:00 the *previous* day once
+// converted to UTC, silently shifting the whole week back by a day. Working
+// entirely in UTC sidesteps that regardless of what timezone this runs in.
 function weekRange(anyDateStr) {
-  const d = new Date(`${anyDateStr}T00:00:00`);
-  const day = d.getDay(); // 0=Sun..6=Sat
+  const [y, m, d] = anyDateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  const day = dt.getUTCDay(); // 0=Sun..6=Sat
   const diffToMonday = day === 0 ? -6 : 1 - day;
-  const monday = new Date(d);
-  monday.setDate(d.getDate() + diffToMonday);
+  const monday = new Date(dt);
+  monday.setUTCDate(dt.getUTCDate() + diffToMonday);
   const days = [];
   for (let i = 0; i < 7; i++) {
     const dd = new Date(monday);
-    dd.setDate(monday.getDate() + i);
+    dd.setUTCDate(monday.getUTCDate() + i);
     days.push(dd.toISOString().slice(0, 10));
   }
   return days;

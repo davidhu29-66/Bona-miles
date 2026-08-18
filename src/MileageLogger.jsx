@@ -164,7 +164,9 @@ export default function MileageLogger() {
   const [showTimeOn, setShowTimeOn] = useState(false);
   const [showFull, setShowFull] = useState(false);
   const [editingTrip, setEditingTrip] = useState(null);
-  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [showFullSession, setShowFullSession] = useState(false);
+  const [editingSession, setEditingSession] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null); // { id, type: "trip" | "session" }
 
   useEffect(() => {
     (async () => {
@@ -548,6 +550,34 @@ export default function MileageLogger() {
     syncToNodeRed({ event: "trip_deleted", tripId: id });
   }
 
+  function saveFullWorkSession(data, existingId) {
+    if (existingId) {
+      let updated = null;
+      const next = workSessions.map((s) => {
+        if (s.id !== existingId) return s;
+        updated = { ...s, ...data };
+        return updated;
+      });
+      persistWorkSessions(next);
+      showToast("success", "Work session updated.");
+      syncToNodeRed({ event: "time_off", session: updated });
+    } else {
+      const session = { id: uid(), ...data };
+      persistWorkSessions([...workSessions, session]);
+      showToast("success", "Work session added.");
+      syncToNodeRed({ event: "time_off", session });
+    }
+    setShowFullSession(false);
+    setEditingSession(null);
+  }
+
+  function deleteWorkSession(id) {
+    persistWorkSessions(workSessions.filter((s) => s.id !== id));
+    setConfirmDelete(null);
+    showToast("success", "Work session deleted.");
+    syncToNodeRed({ event: "session_deleted", sessionId: id });
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
@@ -592,7 +622,13 @@ export default function MileageLogger() {
           />
         )}
         {tab === "history" && (
-          <HistoryTab trips={sortedTrips} onEdit={(t) => setEditingTrip(t)} />
+          <HistoryTab
+            trips={sortedTrips}
+            workSessions={workSessions}
+            onEdit={(t) => setEditingTrip(t)}
+            onEditSession={(s) => setEditingSession(s)}
+            onAddSession={() => setShowFullSession(true)}
+          />
         )}
         {tab === "summary" && <SummaryTab trips={trips} />}
         {tab === "settings" && (
@@ -656,17 +692,35 @@ export default function MileageLogger() {
           initial={editingTrip}
           onClose={() => { setShowFull(false); setEditingTrip(null); }}
           onSave={(data) => saveFullTrip(data, editingTrip ? editingTrip.id : null)}
-          onDelete={editingTrip ? () => setConfirmDelete(editingTrip.id) : null}
+          onDelete={editingTrip ? () => setConfirmDelete({ id: editingTrip.id, type: "trip" }) : null}
+          clients={clients}
+          onAddClient={upsertClient}
+        />
+      )}
+      {(showFullSession || editingSession) && (
+        <FullWorkSessionModal
+          initial={editingSession}
+          onClose={() => { setShowFullSession(false); setEditingSession(null); }}
+          onSave={(data) => saveFullWorkSession(data, editingSession ? editingSession.id : null)}
+          onDelete={editingSession ? () => setConfirmDelete({ id: editingSession.id, type: "session" }) : null}
           clients={clients}
           onAddClient={upsertClient}
         />
       )}
       {confirmDelete && (
         <ConfirmDialog
-          title="Delete this trip?"
+          title={confirmDelete.type === "session" ? "Delete this work session?" : "Delete this trip?"}
           message="This can't be undone."
           onCancel={() => setConfirmDelete(null)}
-          onConfirm={() => { deleteTrip(confirmDelete); setEditingTrip(null); }}
+          onConfirm={() => {
+            if (confirmDelete.type === "session") {
+              deleteWorkSession(confirmDelete.id);
+              setEditingSession(null);
+            } else {
+              deleteTrip(confirmDelete.id);
+              setEditingTrip(null);
+            }
+          }}
         />
       )}
       {toast && <Toast type={toast.type} message={toast.message} />}
@@ -859,37 +913,91 @@ function TripRow({ trip, onClick, compact }) {
   );
 }
 
-function HistoryTab({ trips, onEdit }) {
-  if (trips.length === 0) {
+function SessionRow({ session, onClick, compact }) {
+  const isChargeable = session.businessType === "chargeable";
+  const hrs = session.onDate && session.onTime && session.offDate && session.offTime
+    ? (new Date(`${session.offDate}T${session.offTime}`) - new Date(`${session.onDate}T${session.onTime}`)) / 3600000
+    : null;
+  return (
+    <button
+      onClick={onClick}
+      className="w-full text-left rounded-xl bg-slate-800/50 hover:bg-slate-800 border border-slate-800 p-3 flex items-center gap-3 transition-colors"
+    >
+      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${isChargeable ? "bg-sky-400/10" : "bg-slate-700/40"}`}>
+        <Clock size={15} className={isChargeable ? "text-sky-400" : "text-slate-400"} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1 text-sm font-medium text-slate-100 truncate">
+          {isChargeable ? (session.client || "Chargeable") : "Admin"}
+        </div>
+        <div className="text-xs text-slate-500">
+          {fmtDateLong(session.onDate)}{!compact ? ` · ${session.onTime}–${session.offTime}` : ""}
+          {session.jobNumber && <span className="text-amber-400"> · Job #{session.jobNumber}</span>}
+        </div>
+      </div>
+      <div className="text-right shrink-0">
+        <div className="font-odo text-sm font-semibold text-sky-400">{hrs !== null ? formatDuration(Math.round(hrs * 60)) : "…"}</div>
+        <div className="text-xs text-slate-500">time</div>
+      </div>
+    </button>
+  );
+}
+
+function HistoryTab({ trips, workSessions, onEdit, onEditSession, onAddSession }) {
+  const items = [
+    ...trips.map((t) => ({ _type: "trip", _date: t.date, _key: `${t.date}T${t.timeOut || "00:00"}`, data: t })),
+    ...workSessions.map((s) => ({ _type: "session", _date: s.onDate, _key: `${s.onDate}T${s.onTime || "00:00"}`, data: s })),
+  ].sort((a, b) => (a._key < b._key ? 1 : -1));
+
+  const addButton = (
+    <button
+      onClick={onAddSession}
+      className="w-full py-2.5 rounded-xl bg-slate-900/50 border border-sky-400/30 text-sky-400 font-semibold text-xs flex items-center justify-center gap-1.5 mb-4 active:scale-95 transition-transform"
+    >
+      <Clock size={13} /> Log a work session
+    </button>
+  );
+
+  if (items.length === 0) {
     return (
-      <div className="text-center py-16">
-        <List size={28} className="text-slate-700 mx-auto mb-3" />
-        <div className="text-slate-400 text-sm font-medium">No trips yet</div>
-        <div className="text-slate-600 text-xs mt-1">Your logged trips will show up here</div>
+      <div>
+        {addButton}
+        <div className="text-center py-16">
+          <List size={28} className="text-slate-700 mx-auto mb-3" />
+          <div className="text-slate-400 text-sm font-medium">No trips yet</div>
+          <div className="text-slate-600 text-xs mt-1">Your logged trips will show up here</div>
+        </div>
       </div>
     );
   }
   const groups = {};
-  trips.forEach((t) => {
-    const ym = t.date.slice(0, 7);
+  items.forEach((item) => {
+    const ym = item._date.slice(0, 7);
     if (!groups[ym]) groups[ym] = [];
-    groups[ym].push(t);
+    groups[ym].push(item);
   });
   const months = Object.keys(groups).sort().reverse();
   return (
-    <div className="space-y-5">
-      {months.map((ym) => (
-        <div key={ym}>
-          <div className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2 px-1">
-            {monthLabel(ym)}
+    <div>
+      {addButton}
+      <div className="space-y-5">
+        {months.map((ym) => (
+          <div key={ym}>
+            <div className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2 px-1">
+              {monthLabel(ym)}
+            </div>
+            <div className="space-y-2">
+              {groups[ym].map((item) =>
+                item._type === "trip" ? (
+                  <TripRow key={`t-${item.data.id}`} trip={item.data} onClick={() => onEdit(item.data)} />
+                ) : (
+                  <SessionRow key={`s-${item.data.id}`} session={item.data} onClick={() => onEditSession(item.data)} />
+                )
+              )}
+            </div>
           </div>
-          <div className="space-y-2">
-            {groups[ym].map((t) => (
-              <TripRow key={t.id} trip={t} onClick={() => onEdit(t)} />
-            ))}
-          </div>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }
@@ -1750,6 +1858,137 @@ function TimeOnModal({ clients, onAddClient, onClose, onStart }) {
         </button>
       }
     >
+      <Field label="Type">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setBusinessType("admin")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            Admin
+          </button>
+          <button
+            onClick={() => setBusinessType("chargeable")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            <Receipt size={14} /> Chargeable
+          </button>
+        </div>
+      </Field>
+      {businessType === "chargeable" && !addingNew && (
+        <Field label="Client">
+          <select
+            value={clients.includes(client) ? client : ""}
+            onChange={(e) => {
+              if (e.target.value === "__add_new__") setAddingNew(true);
+              else setClient(e.target.value);
+            }}
+            className={inputClsPlain}
+          >
+            <option value="">Select client…</option>
+            {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__add_new__">+ Add new client…</option>
+          </select>
+        </Field>
+      )}
+      {businessType === "chargeable" && addingNew && (
+        <Field label="New client">
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={newClientName}
+              onChange={(e) => setNewClientName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+              placeholder="Client name"
+              className={inputClsPlain}
+            />
+            <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
+            <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
+          </div>
+        </Field>
+      )}
+      <Field label="Job number (optional)">
+        <input
+          value={jobNumber}
+          onChange={(e) => setJobNumber(e.target.value)}
+          placeholder="e.g. 4521 — leave blank if not generated yet"
+          className={inputClsPlain}
+        />
+      </Field>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Manual add/edit for a work session — the backfill counterpart to Time
+// On/Off, for a job you did but forgot to (or couldn't) toggle live.
+function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onAddClient }) {
+  const [onDate, setOnDate] = useState(initial?.onDate || todayStr());
+  const [onTime, setOnTime] = useState(initial?.onTime || nowTimeStr());
+  const [offDate, setOffDate] = useState(initial?.offDate || initial?.onDate || todayStr());
+  const [offTime, setOffTime] = useState(initial?.offTime || nowTimeStr());
+  const [businessType, setBusinessType] = useState(initial?.businessType || "chargeable");
+  const [client, setClient] = useState(initial?.client || "");
+  const [jobNumber, setJobNumber] = useState(initial?.jobNumber || "");
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [error, setError] = useState("");
+
+  const hrs = onDate && onTime && offDate && offTime
+    ? (new Date(`${offDate}T${offTime}`) - new Date(`${onDate}T${onTime}`)) / 3600000
+    : null;
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    setClient(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
+  function submit() {
+    if (businessType === "chargeable" && !client) return setError("Pick a client, or add a new one.");
+    if (hrs === null || hrs <= 0) return setError("Time off must be after time on.");
+    setError("");
+    onSave({
+      onDate, onTime, offDate, offTime,
+      category: "business", businessType,
+      client: businessType === "chargeable" ? client : "",
+      jobNumber,
+    });
+  }
+
+  return (
+    <Modal
+      title={initial ? "Edit Work Session" : "Log a Work Session"}
+      onClose={onClose}
+      bgImage={bgForCategory("business", businessType)}
+      footer={
+        <div>
+          {hrs !== null && hrs > 0 && (
+            <div className="text-center mb-3">
+              <span className="font-odo text-2xl font-bold text-sky-400">{formatDuration(Math.round(hrs * 60))}</span>
+            </div>
+          )}
+          <button onClick={submit} className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold flex items-center justify-center gap-2 mb-2">
+            <Check size={16} /> {initial ? "Save Changes" : "Add Session"}
+          </button>
+          {onDelete && (
+            <button onClick={onDelete} className="w-full py-2.5 rounded-xl bg-rose-400/10 border border-rose-400/30 text-rose-400 font-semibold text-sm flex items-center justify-center gap-2">
+              <Trash2 size={14} /> Delete Session
+            </button>
+          )}
+        </div>
+      }
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="On date"><input type="date" value={onDate} onChange={(e) => setOnDate(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="On time"><input type="time" value={onTime} onChange={(e) => setOnTime(e.target.value)} className={inputCls} /></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Off date"><input type="date" value={offDate} onChange={(e) => setOffDate(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="Off time"><input type="time" value={offTime} onChange={(e) => setOffTime(e.target.value)} className={inputCls} /></Field>
+      </div>
       <Field label="Type">
         <div className="flex gap-2">
           <button
