@@ -108,6 +108,20 @@ Business trips now split further into **Admin** (non-client work, e.g. commuting
 you export a chargeable-only CSV for client invoicing. Trips saved before this update show as
 "Admin" by default until you edit them — nothing is silently reclassified as billable.
 
+## Importing historical trips
+
+Settings → "Import trips from CSV" — for consolidating older mileage records (from before this
+app existed) into the same trip history everything else uses. Expects the same columns the app's
+own CSV export produces (Date, Time Out, From, Odometer Out, Time In, To, Odometer In, KM,
+Category, Business Type, Client, Purpose, Job Number, Site Notes) — easiest path is normally
+reshaping old data into that exact format, then importing.
+
+Shows a preview (trip count, any rows that failed to parse and why) before anything is committed.
+Trips matching one already in your log — same date, time out, and odometer out — are skipped
+automatically, so it's safe to run the same file through twice without doubling up. Any new
+location or client names in the file get added to their respective managed lists too, same as if
+you'd typed them in through the app.
+
 ## Backfilling a work session
 
 History now interleaves trips and work sessions chronologically (not two separate lists), and has
