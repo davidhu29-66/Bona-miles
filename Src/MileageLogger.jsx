@@ -3,11 +3,13 @@ import {
   Gauge, Clock, Plus, X, Trash2, Settings as SettingsIcon,
   List, BarChart3, ChevronLeft, ChevronRight, Briefcase, Home as HomeIcon,
   Download, ArrowRight, AlertTriangle, Check, Car, LocateFixed, MapPin, Receipt,
-  Radio, Send,
+  Radio, Send, FileSpreadsheet,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
 } from "recharts";
+import { generateTimesheetBlob, lastWeekAnchor } from "./generateTimesheet.js";
+import { weekRange } from "./timesheetLogic.js";
 
 const DEFAULT_LOCATIONS = [{ name: "Home", lat: null, lng: null }, { name: "Office", lat: null, lng: null }];
 const GPS_MATCH_RADIUS_M = 200;
@@ -70,6 +72,86 @@ function fmtDateLong(dateStr) {
 }
 function sortKey(t) {
   return `${t.date}T${t.timeOut || "00:00"}`;
+}
+
+// Minimal RFC4180-ish CSV parser — handles quoted fields containing commas,
+// quotes ("" escaping), and newlines, which the app's own CSV export
+// produces for Client/Purpose/Site Notes. Not a general-purpose parser, but
+// sufficient for round-tripping this app's own export format.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => { pushField(); rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      pushField();
+    } else if (c === "\n") {
+      if (field !== "" || row.length > 0) pushRow();
+    } else if (c === "\r") {
+      // ignore, \n handles the row break
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) pushRow();
+  return rows.filter((r) => r.length > 1 || r[0] !== "");
+}
+
+const IMPORT_HEADER = ["Date", "Time Out", "From", "Odometer Out", "Time In", "To", "Odometer In", "KM", "Category", "Business Type", "Client", "Purpose", "Job Number", "Site Notes"];
+
+// Turns parsed CSV rows into trip objects, matching exportCsv()'s column
+// order exactly. Returns { trips, errors } — malformed rows are skipped and
+// reported by row number rather than aborting the whole import.
+function csvRowsToTrips(rows) {
+  const trips = [];
+  const errors = [];
+  const headerRow = rows[0] || [];
+  const looksLikeHeader = headerRow[0] && headerRow[0].trim().toLowerCase() === "date";
+  const dataRows = looksLikeHeader ? rows.slice(1) : rows;
+  const startLine = looksLikeHeader ? 2 : 1;
+
+  dataRows.forEach((cols, i) => {
+    const lineNum = startLine + i;
+    if (cols.length < 8) { errors.push(`Row ${lineNum}: too few columns, skipped.`); return; }
+    const [date, timeOut, fromLocation, mileageOutRaw, timeIn, toLocation, mileageInRaw, , category, businessType, client, purpose, jobNumber, siteNotes] = cols;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test((date || "").trim())) { errors.push(`Row ${lineNum}: date "${date}" isn't YYYY-MM-DD, skipped.`); return; }
+    const mileageOut = Number(mileageOutRaw);
+    const mileageIn = Number(mileageInRaw);
+    if (!Number.isFinite(mileageOut) || !Number.isFinite(mileageIn)) { errors.push(`Row ${lineNum}: odometer values aren't numbers, skipped.`); return; }
+    if (mileageIn < mileageOut) { errors.push(`Row ${lineNum}: odometer in is less than odometer out, skipped.`); return; }
+    if (!fromLocation || !toLocation) { errors.push(`Row ${lineNum}: missing From/To location, skipped.`); return; }
+    const cat = (category || "").trim().toLowerCase() === "private" ? "private" : "business";
+    trips.push({
+      id: uid(),
+      date: date.trim(),
+      timeOut: (timeOut || "00:00").trim(),
+      mileageOut,
+      fromLocation: fromLocation.trim(),
+      timeIn: (timeIn || "00:00").trim(),
+      mileageIn,
+      toLocation: toLocation.trim(),
+      category: cat,
+      businessType: cat === "business" ? ((businessType || "").trim() === "chargeable" ? "chargeable" : "admin") : null,
+      client: cat === "business" ? (client || "").trim() : "",
+      purpose: (purpose || "").trim(),
+      jobNumber: (jobNumber || "").trim(),
+      siteNotes: (siteNotes || "").trim(),
+    });
+  });
+  return { trips, errors };
 }
 function monthLabel(ym) {
   const [y, m] = ym.split("-");
@@ -147,22 +229,33 @@ export default function MileageLogger() {
   const [loading, setLoading] = useState(true);
   const [trips, setTrips] = useState([]);
   const [locations, setLocations] = useState(DEFAULT_LOCATIONS);
+  const [clients, setClients] = useState([]);
+  const [workSessions, setWorkSessions] = useState([]);
+  const [activeTimer, setActiveTimer] = useState(null);
   const [nodeRedUrl, setNodeRedUrl] = useState("");
   const [nodeRedEnabled, setNodeRedEnabled] = useState(false);
+  const [timesheetName, setTimesheetName] = useState("");
+  const [timesheetRegion, setTimesheetRegion] = useState("");
   const [tab, setTab] = useState("log");
   const [toast, setToast] = useState(null);
 
   const [showStart, setShowStart] = useState(false);
   const [showEnd, setShowEnd] = useState(false);
+  const [showTimeOn, setShowTimeOn] = useState(false);
+  const [showImportCsv, setShowImportCsv] = useState(false);
   const [showFull, setShowFull] = useState(false);
   const [editingTrip, setEditingTrip] = useState(null);
-  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [showFullSession, setShowFullSession] = useState(false);
+  const [editingSession, setEditingSession] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null); // { id, type: "trip" | "session" }
 
   useEffect(() => {
     (async () => {
+      let loadedTrips = [];
       try {
         const res = await window.storage.get("trips", false);
-        setTrips(res ? JSON.parse(res.value) : []);
+        loadedTrips = res ? JSON.parse(res.value) : [];
+        setTrips(loadedTrips);
       } catch (e) {
         setTrips([]);
       }
@@ -176,10 +269,48 @@ export default function MileageLogger() {
         setLocations(DEFAULT_LOCATIONS);
       }
       try {
+        const res = await window.storage.get("clients", false);
+        const loadedClients = res ? JSON.parse(res.value) : [];
+        if (loadedClients.length === 0 && loadedTrips.length > 0) {
+          // One-time migration: this list used to be free-text per trip.
+          // Seed it from whatever client names already appear in history so
+          // nothing "disappears" the first time this list is used.
+          const seen = new Set();
+          const seeded = [];
+          for (const t of loadedTrips) {
+            const name = t.client && t.client.trim();
+            if (name && !seen.has(name.toLowerCase())) {
+              seen.add(name.toLowerCase());
+              seeded.push(name);
+            }
+          }
+          setClients(seeded);
+          if (seeded.length) await window.storage.set("clients", JSON.stringify(seeded), false);
+        } else {
+          setClients(loadedClients);
+        }
+      } catch (e) {
+        setClients([]);
+      }
+      try {
+        const res = await window.storage.get("workSessions", false);
+        setWorkSessions(res ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setWorkSessions([]);
+      }
+      try {
+        const res = await window.storage.get("activeTimer", false);
+        setActiveTimer(res ? JSON.parse(res.value) : null);
+      } catch (e) {
+        setActiveTimer(null);
+      }
+      try {
         const res = await window.storage.get("settings", false);
         const s = res ? JSON.parse(res.value) : {};
         setNodeRedUrl(s.nodeRedUrl || "");
         setNodeRedEnabled(!!s.nodeRedEnabled);
+        setTimesheetName(s.timesheetName || "");
+        setTimesheetRegion(s.timesheetRegion || "");
       } catch (e) {
         // no settings saved yet — defaults are fine
       }
@@ -210,10 +341,111 @@ export default function MileageLogger() {
     }
   }
 
+  async function persistClients(next) {
+    setClients(next);
+    try {
+      await window.storage.set("clients", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that client.");
+    }
+  }
+
+  function upsertClient(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (clients.some((c) => c.toLowerCase() === trimmed.toLowerCase())) return;
+    persistClients([...clients, trimmed]);
+  }
+
+  async function persistWorkSessions(next) {
+    setWorkSessions(next);
+    try {
+      await window.storage.set("workSessions", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that work session.");
+    }
+  }
+
+  async function persistActiveTimer(next) {
+    setActiveTimer(next);
+    try {
+      if (next) {
+        await window.storage.set("activeTimer", JSON.stringify(next), false);
+      } else {
+        await window.storage.delete("activeTimer", false);
+      }
+    } catch (e) {
+      showToast("error", "Couldn't save timer state.");
+    }
+  }
+
+  // Explicit time-tracking, separate from trip logging. Exists specifically
+  // because inferring "how long was I actually working this job" from trip
+  // legs and dwell-time proved unreliable (see timesheetLogic.js) — this is
+  // the unambiguous alternative: you say when it starts and stops.
+  function timeOn(data) {
+    if (activeTimer) return; // one job at a time
+    const timer = {
+      id: uid(),
+      onDate: todayStr(),
+      onTime: nowTimeStr(),
+      category: data.category,
+      businessType: data.category === "business" ? data.businessType : null,
+      client: data.category === "business" && data.businessType === "chargeable" ? (data.client || "") : "",
+      jobNumber: data.jobNumber || "",
+    };
+    persistActiveTimer(timer);
+    showToast("success", `Time on — ${timer.businessType === "chargeable" ? timer.client || "Chargeable" : "Admin"}.`);
+    syncToNodeRed({ event: "time_on", timer });
+  }
+
+  function timeOff() {
+    if (!activeTimer) return;
+    const session = {
+      ...activeTimer,
+      offDate: todayStr(),
+      offTime: nowTimeStr(),
+    };
+    persistWorkSessions([...workSessions, session]);
+    persistActiveTimer(null);
+    showToast("success", "Time off — session logged.");
+    syncToNodeRed({ event: "time_off", session });
+  }
+
+  const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
+
+  async function handleGenerateTimesheet() {
+    setGeneratingTimesheet(true);
+    try {
+      const anchor = lastWeekAnchor();
+      const { blob, overflowClients, weekDays } = await generateTimesheetBlob(
+        trips, workSessions, anchor, { name: timesheetName, region: timesheetRegion }
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Timesheet_${weekDays[0]}_to_${weekDays[6]}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      if (overflowClients.length > 0) {
+        showToast("error", `${overflowClients.length} client/job pair(s) didn't fit the template's 9 columns — check the sheet.`);
+      } else {
+        showToast("success", `Timesheet generated: ${weekDays[0]} to ${weekDays[6]}.`);
+      }
+    } catch (e) {
+      showToast("error", "Couldn't generate the timesheet — " + (e.message || "unknown error"));
+    }
+    setGeneratingTimesheet(false);
+  }
+
   async function persistSettings(next) {
-    const merged = { nodeRedUrl, nodeRedEnabled, ...next };
+    const merged = { nodeRedUrl, nodeRedEnabled, timesheetName, timesheetRegion, ...next };
     if ("nodeRedUrl" in next) setNodeRedUrl(next.nodeRedUrl);
     if ("nodeRedEnabled" in next) setNodeRedEnabled(next.nodeRedEnabled);
+    if ("timesheetName" in next) setTimesheetName(next.timesheetName);
+    if ("timesheetRegion" in next) setTimesheetRegion(next.timesheetRegion);
     try {
       await window.storage.set("settings", JSON.stringify(merged), false);
     } catch (e) {
@@ -339,6 +571,35 @@ export default function MileageLogger() {
     syncToNodeRed({ event: "trip_completed", trip: updated });
   }
 
+  // Dedup fingerprint: same date+timeOut+mileageOut is treated as "already
+  // logged" — safe to re-run an import without creating duplicates.
+  function importTripsCsv(parsedTrips) {
+    const existingKeys = new Set(trips.map((t) => `${t.date}|${t.timeOut}|${t.mileageOut}`));
+    const newTrips = [];
+    let duplicates = 0;
+    for (const t of parsedTrips) {
+      const key = `${t.date}|${t.timeOut}|${t.mileageOut}`;
+      if (existingKeys.has(key)) { duplicates++; continue; }
+      existingKeys.add(key);
+      newTrips.push(t);
+    }
+    if (newTrips.length > 0) {
+      persistTrips([...trips, ...newTrips]);
+      const newLocationNames = new Set();
+      const newClientNames = new Set();
+      newTrips.forEach((t) => {
+        newLocationNames.add(t.fromLocation);
+        newLocationNames.add(t.toLocation);
+        if (t.client) newClientNames.add(t.client);
+      });
+      newLocationNames.forEach((name) => {
+        if (!locations.some((l) => l.name === name)) upsertLocation(name);
+      });
+      newClientNames.forEach((name) => upsertClient(name));
+    }
+    return { imported: newTrips.length, duplicates };
+  }
+
   function saveFullTrip(data, existingId) {
     if (existingId) {
       let updated = null;
@@ -399,6 +660,34 @@ export default function MileageLogger() {
     syncToNodeRed({ event: "trip_deleted", tripId: id });
   }
 
+  function saveFullWorkSession(data, existingId) {
+    if (existingId) {
+      let updated = null;
+      const next = workSessions.map((s) => {
+        if (s.id !== existingId) return s;
+        updated = { ...s, ...data };
+        return updated;
+      });
+      persistWorkSessions(next);
+      showToast("success", "Work session updated.");
+      syncToNodeRed({ event: "time_off", session: updated });
+    } else {
+      const session = { id: uid(), ...data };
+      persistWorkSessions([...workSessions, session]);
+      showToast("success", "Work session added.");
+      syncToNodeRed({ event: "time_off", session });
+    }
+    setShowFullSession(false);
+    setEditingSession(null);
+  }
+
+  function deleteWorkSession(id) {
+    persistWorkSessions(workSessions.filter((s) => s.id !== id));
+    setConfirmDelete(null);
+    showToast("success", "Work session deleted.");
+    syncToNodeRed({ event: "session_deleted", sessionId: id });
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
@@ -437,10 +726,19 @@ export default function MileageLogger() {
             onFull={() => { setEditingTrip(null); setShowFull(true); }}
             onViewAll={() => setTab("history")}
             onEditTrip={(t) => setEditingTrip(t)}
+            activeTimer={activeTimer}
+            onTimeOn={() => setShowTimeOn(true)}
+            onTimeOff={timeOff}
           />
         )}
         {tab === "history" && (
-          <HistoryTab trips={sortedTrips} onEdit={(t) => setEditingTrip(t)} />
+          <HistoryTab
+            trips={sortedTrips}
+            workSessions={workSessions}
+            onEdit={(t) => setEditingTrip(t)}
+            onEditSession={(s) => setEditingSession(s)}
+            onAddSession={() => setShowFullSession(true)}
+          />
         )}
         {tab === "summary" && <SummaryTab trips={trips} />}
         {tab === "settings" && (
@@ -456,6 +754,16 @@ export default function MileageLogger() {
             onNodeRedEnabledChange={(enabled) => persistSettings({ nodeRedEnabled: enabled })}
             onTestPing={() => syncToNodeRed({ event: "test", message: "Hello from Mileage Logger" }, { force: true })}
             onSyncAll={() => syncToNodeRed({ event: "full_sync", trips }, { force: true })}
+            clients={clients}
+            onAddClient={upsertClient}
+            onRemoveClient={(name) => persistClients(clients.filter((c) => c !== name))}
+            timesheetName={timesheetName}
+            timesheetRegion={timesheetRegion}
+            onTimesheetNameChange={(v) => persistSettings({ timesheetName: v })}
+            onTimesheetRegionChange={(v) => persistSettings({ timesheetRegion: v })}
+            onGenerateTimesheet={handleGenerateTimesheet}
+            generatingTimesheet={generatingTimesheet}
+            onOpenImport={() => setShowImportCsv(true)}
           />
         )}
       </main>
@@ -469,6 +777,8 @@ export default function MileageLogger() {
           suggestedMileage={lastMileage}
           onClose={() => setShowStart(false)}
           onSave={startTrip}
+          clients={clients}
+          onAddClient={upsertClient}
         />
       )}
       {showEnd && activeTrip && (
@@ -479,21 +789,55 @@ export default function MileageLogger() {
           onSave={(data) => endTrip(activeTrip.id, data)}
         />
       )}
+      {showTimeOn && (
+        <TimeOnModal
+          clients={clients}
+          onAddClient={upsertClient}
+          onClose={() => setShowTimeOn(false)}
+          onStart={(data) => { timeOn(data); setShowTimeOn(false); }}
+        />
+      )}
       {(showFull || editingTrip) && (
         <FullTripModal
           locations={locations}
           initial={editingTrip}
           onClose={() => { setShowFull(false); setEditingTrip(null); }}
           onSave={(data) => saveFullTrip(data, editingTrip ? editingTrip.id : null)}
-          onDelete={editingTrip ? () => setConfirmDelete(editingTrip.id) : null}
+          onDelete={editingTrip ? () => setConfirmDelete({ id: editingTrip.id, type: "trip" }) : null}
+          clients={clients}
+          onAddClient={upsertClient}
+        />
+      )}
+      {(showFullSession || editingSession) && (
+        <FullWorkSessionModal
+          initial={editingSession}
+          onClose={() => { setShowFullSession(false); setEditingSession(null); }}
+          onSave={(data) => saveFullWorkSession(data, editingSession ? editingSession.id : null)}
+          onDelete={editingSession ? () => setConfirmDelete({ id: editingSession.id, type: "session" }) : null}
+          clients={clients}
+          onAddClient={upsertClient}
+        />
+      )}
+      {showImportCsv && (
+        <ImportCsvModal
+          onClose={() => setShowImportCsv(false)}
+          onImport={importTripsCsv}
         />
       )}
       {confirmDelete && (
         <ConfirmDialog
-          title="Delete this trip?"
+          title={confirmDelete.type === "session" ? "Delete this work session?" : "Delete this trip?"}
           message="This can't be undone."
           onCancel={() => setConfirmDelete(null)}
-          onConfirm={() => { deleteTrip(confirmDelete); setEditingTrip(null); }}
+          onConfirm={() => {
+            if (confirmDelete.type === "session") {
+              deleteWorkSession(confirmDelete.id);
+              setEditingSession(null);
+            } else {
+              deleteTrip(confirmDelete.id);
+              setEditingTrip(null);
+            }
+          }}
         />
       )}
       {toast && <Toast type={toast.type} message={toast.message} />}
@@ -530,7 +874,7 @@ function Header({ lastMileage, lastMileageMeta, activeTrip }) {
   );
 }
 
-function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, onEditTrip }) {
+function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, onEditTrip, activeTimer, onTimeOn, onTimeOff }) {
   return (
     <div className="space-y-4">
       {activeTrip ? (
@@ -566,6 +910,39 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
         </button>
       )}
 
+      {activeTimer ? (
+        <div className="rounded-2xl bg-slate-900/50 border border-sky-400/20 p-4">
+          <div className="flex items-center gap-2 text-sky-400 text-xs font-semibold uppercase tracking-wide mb-3">
+            <Clock size={14} /> Job timer running
+          </div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-slate-400 text-sm">
+              {activeTimer.businessType === "chargeable" ? (activeTimer.client || "Chargeable") : "Admin"}
+            </span>
+            {activeTimer.jobNumber && <span className="text-slate-500 text-xs">Job #{activeTimer.jobNumber}</span>}
+          </div>
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-slate-400 text-sm">Elapsed</span>
+            <span className="font-odo text-lg text-sky-400">
+              <ElapsedTime sinceDate={activeTimer.onDate} sinceTime={activeTimer.onTime} />
+            </span>
+          </div>
+          <button
+            onClick={onTimeOff}
+            className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
+          >
+            Time Off
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onTimeOn}
+          className="w-full py-3.5 rounded-xl bg-slate-900/50 border border-sky-400/30 text-sky-400 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
+        >
+          <Clock size={18} /> Time On
+        </button>
+      )}
+
       <button
         onClick={onFull}
         className="w-full py-3 rounded-xl bg-slate-900/50 border border-slate-800/60 text-slate-300 font-semibold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform"
@@ -595,6 +972,19 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
       </div>
     </div>
   );
+}
+
+function ElapsedTime({ sinceDate, sinceTime }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const start = new Date(`${sinceDate}T${sinceTime}`).getTime();
+  const diffMin = Math.max(0, Math.floor((now - start) / 60000));
+  const h = Math.floor(diffMin / 60);
+  const m = diffMin % 60;
+  return <span>{h}h {String(m).padStart(2, "0")}m</span>;
 }
 
 function TripRow({ trip, onClick, compact }) {
@@ -640,37 +1030,91 @@ function TripRow({ trip, onClick, compact }) {
   );
 }
 
-function HistoryTab({ trips, onEdit }) {
-  if (trips.length === 0) {
+function SessionRow({ session, onClick, compact }) {
+  const isChargeable = session.businessType === "chargeable";
+  const hrs = session.onDate && session.onTime && session.offDate && session.offTime
+    ? (new Date(`${session.offDate}T${session.offTime}`) - new Date(`${session.onDate}T${session.onTime}`)) / 3600000
+    : null;
+  return (
+    <button
+      onClick={onClick}
+      className="w-full text-left rounded-xl bg-slate-800/50 hover:bg-slate-800 border border-slate-800 p-3 flex items-center gap-3 transition-colors"
+    >
+      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${isChargeable ? "bg-sky-400/10" : "bg-slate-700/40"}`}>
+        <Clock size={15} className={isChargeable ? "text-sky-400" : "text-slate-400"} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1 text-sm font-medium text-slate-100 truncate">
+          {isChargeable ? (session.client || "Chargeable") : "Admin"}
+        </div>
+        <div className="text-xs text-slate-500">
+          {fmtDateLong(session.onDate)}{!compact ? ` · ${session.onTime}–${session.offTime}` : ""}
+          {session.jobNumber && <span className="text-amber-400"> · Job #{session.jobNumber}</span>}
+        </div>
+      </div>
+      <div className="text-right shrink-0">
+        <div className="font-odo text-sm font-semibold text-sky-400">{hrs !== null ? formatDuration(Math.round(hrs * 60)) : "…"}</div>
+        <div className="text-xs text-slate-500">time</div>
+      </div>
+    </button>
+  );
+}
+
+function HistoryTab({ trips, workSessions, onEdit, onEditSession, onAddSession }) {
+  const items = [
+    ...trips.map((t) => ({ _type: "trip", _date: t.date, _key: `${t.date}T${t.timeOut || "00:00"}`, data: t })),
+    ...workSessions.map((s) => ({ _type: "session", _date: s.onDate, _key: `${s.onDate}T${s.onTime || "00:00"}`, data: s })),
+  ].sort((a, b) => (a._key < b._key ? 1 : -1));
+
+  const addButton = (
+    <button
+      onClick={onAddSession}
+      className="w-full py-2.5 rounded-xl bg-slate-900/50 border border-sky-400/30 text-sky-400 font-semibold text-xs flex items-center justify-center gap-1.5 mb-4 active:scale-95 transition-transform"
+    >
+      <Clock size={13} /> Log a work session
+    </button>
+  );
+
+  if (items.length === 0) {
     return (
-      <div className="text-center py-16">
-        <List size={28} className="text-slate-700 mx-auto mb-3" />
-        <div className="text-slate-400 text-sm font-medium">No trips yet</div>
-        <div className="text-slate-600 text-xs mt-1">Your logged trips will show up here</div>
+      <div>
+        {addButton}
+        <div className="text-center py-16">
+          <List size={28} className="text-slate-700 mx-auto mb-3" />
+          <div className="text-slate-400 text-sm font-medium">No trips yet</div>
+          <div className="text-slate-600 text-xs mt-1">Your logged trips will show up here</div>
+        </div>
       </div>
     );
   }
   const groups = {};
-  trips.forEach((t) => {
-    const ym = t.date.slice(0, 7);
+  items.forEach((item) => {
+    const ym = item._date.slice(0, 7);
     if (!groups[ym]) groups[ym] = [];
-    groups[ym].push(t);
+    groups[ym].push(item);
   });
   const months = Object.keys(groups).sort().reverse();
   return (
-    <div className="space-y-5">
-      {months.map((ym) => (
-        <div key={ym}>
-          <div className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2 px-1">
-            {monthLabel(ym)}
+    <div>
+      {addButton}
+      <div className="space-y-5">
+        {months.map((ym) => (
+          <div key={ym}>
+            <div className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2 px-1">
+              {monthLabel(ym)}
+            </div>
+            <div className="space-y-2">
+              {groups[ym].map((item) =>
+                item._type === "trip" ? (
+                  <TripRow key={`t-${item.data.id}`} trip={item.data} onClick={() => onEdit(item.data)} />
+                ) : (
+                  <SessionRow key={`s-${item.data.id}`} session={item.data} onClick={() => onEditSession(item.data)} />
+                )
+              )}
+            </div>
           </div>
-          <div className="space-y-2">
-            {groups[ym].map((t) => (
-              <TripRow key={t.id} trip={t} onClick={() => onEdit(t)} />
-            ))}
-          </div>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }
@@ -907,13 +1351,19 @@ function StatCard({ label, value, sub, accent }) {
 function SettingsTab({
   locations, onAddLocation, onRemoveLocation, onPinLocation, trips,
   nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
+  clients, onAddClient, onRemoveClient,
+  timesheetName, timesheetRegion, onTimesheetNameChange, onTimesheetRegionChange,
+  onGenerateTimesheet, generatingTimesheet, onOpenImport,
 }) {
   const [newLoc, setNewLoc] = useState("");
+  const [newClient, setNewClient] = useState("");
   const [pinningName, setPinningName] = useState(null);
   const [pinError, setPinError] = useState("");
   const [urlDraft, setUrlDraft] = useState(nodeRedUrl);
   const [pingStatus, setPingStatus] = useState(null); // null | "sending" | "ok" | "fail"
   const [syncStatus, setSyncStatus] = useState(null);
+  const [nameDraft, setNameDraft] = useState(timesheetName);
+  const [regionDraft, setRegionDraft] = useState(timesheetRegion);
 
   async function handlePin(name) {
     setPinningName(name);
@@ -985,6 +1435,79 @@ function SettingsTab({
       </div>
 
       <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="text-sm font-semibold text-slate-300 mb-1">Chargeable clients</div>
+        <div className="text-xs text-slate-500 mb-3">
+          This exact list is what you pick from when logging a Chargeable trip — keep names
+          consistent here so timesheet/billing exports always match up.
+        </div>
+        <div className="flex flex-col gap-2 mb-3">
+          {clients.length === 0 && (
+            <div className="text-xs text-slate-600 italic">No clients yet — add your first one below.</div>
+          )}
+          {clients.map((c) => (
+            <div key={c} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-800">
+              <Receipt size={14} className="text-sky-400 shrink-0" />
+              <span className="flex-1 text-sm text-slate-200">{c}</span>
+              <button onClick={() => onRemoveClient(c)}><X size={13} className="text-slate-500" /></button>
+            </div>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input
+            value={newClient}
+            onChange={(e) => setNewClient(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newClient.trim()) { onAddClient(newClient.trim()); setNewClient(""); }
+            }}
+            placeholder="Add a client (e.g. SBSA Caledon)"
+            className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-amber-400/50"
+          />
+          <button
+            onClick={() => { if (newClient.trim()) { onAddClient(newClient.trim()); setNewClient(""); } }}
+            className="px-4 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm"
+          >
+            Add
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="text-sm font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+          <FileSpreadsheet size={14} className="text-emerald-400" /> Weekly timesheet
+        </div>
+        <div className="text-xs text-slate-500 mb-3">
+          Fills the HR-018 template from your logged trips and Time On/Off sessions — every
+          formula, merged cell, and format stays exactly as the template defines it. Always
+          generates last week (Monday–Sunday), whatever day it is when you tap it.
+        </div>
+        <Field label="Your name">
+          <input
+            value={nameDraft}
+            onChange={(e) => setNameDraft(e.target.value)}
+            onBlur={() => onTimesheetNameChange(nameDraft)}
+            placeholder="e.g. David Hughes"
+            className={inputClsPlain}
+          />
+        </Field>
+        <Field label="Region">
+          <input
+            value={regionDraft}
+            onChange={(e) => setRegionDraft(e.target.value)}
+            onBlur={() => onTimesheetRegionChange(regionDraft)}
+            placeholder="e.g. Western Cape"
+            className={inputClsPlain}
+          />
+        </Field>
+        <button
+          onClick={onGenerateTimesheet}
+          disabled={generatingTimesheet}
+          className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform disabled:opacity-50 mt-1"
+        >
+          <FileSpreadsheet size={16} /> {generatingTimesheet ? "Generating…" : "Generate last week's timesheet"}
+        </button>
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
         <div className="flex items-center justify-between mb-1">
           <div className="text-sm font-semibold text-slate-300 flex items-center gap-1.5">
             <Radio size={14} className="text-sky-400" /> Node-RED sync
@@ -1043,6 +1566,12 @@ function SettingsTab({
         <div className="text-xs text-slate-500 mb-3">
           {trips.length} trip{trips.length === 1 ? "" : "s"} stored, saved automatically as you go.
         </div>
+        <button
+          onClick={onOpenImport}
+          className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-300 text-sm font-medium flex items-center justify-center gap-2 mb-2"
+        >
+          <Download size={14} className="rotate-180" /> Import trips from CSV
+        </button>
         {typeof window !== "undefined" && window.appSignOut && (
           <button
             onClick={() => window.appSignOut()}
@@ -1208,7 +1737,19 @@ function LocateButton({ locations, onMatch, onNoMatch }) {
   );
 }
 
-function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, client, onClientChange }) {
+function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, client, onClientChange, clients, onAddClient }) {
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    onClientChange(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
   return (
     <div>
       <div className="flex gap-2">
@@ -1242,13 +1783,42 @@ function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, c
               <Receipt size={12} /> Chargeable
             </button>
           </div>
-          {businessType === "chargeable" && (
-            <input
-              value={client}
-              onChange={(e) => onClientChange(e.target.value)}
-              placeholder="Client name (optional)"
+          {businessType === "chargeable" && !addingNew && (
+            <select
+              value={clients.includes(client) ? client : ""}
+              onChange={(e) => {
+                if (e.target.value === "__add_new__") {
+                  setAddingNew(true);
+                } else {
+                  onClientChange(e.target.value);
+                }
+              }}
               className={`${inputClsPlain} mt-2`}
-            />
+            >
+              <option value="">Select client…</option>
+              {clients.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+              <option value="__add_new__">+ Add new client…</option>
+            </select>
+          )}
+          {businessType === "chargeable" && addingNew && (
+            <div className="flex gap-2 mt-2">
+              <input
+                autoFocus
+                value={newClientName}
+                onChange={(e) => setNewClientName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+                placeholder="New client name"
+                className={inputClsPlain}
+              />
+              <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">
+                Add
+              </button>
+              <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0">
+                <X size={16} />
+              </button>
+            </div>
           )}
         </div>
       )}
@@ -1256,7 +1826,7 @@ function CategoryToggle({ value, onChange, businessType, onBusinessTypeChange, c
   );
 }
 
-function StartTripModal({ locations, suggestedMileage, onClose, onSave }) {
+function StartTripModal({ locations, suggestedMileage, onClose, onSave, clients, onAddClient }) {
   const [date, setDate] = useState(todayStr());
   const [timeOut, setTimeOut] = useState(nowTimeStr());
   const [mileageOut, setMileageOut] = useState(suggestedMileage !== null ? String(suggestedMileage) : "");
@@ -1306,6 +1876,7 @@ function StartTripModal({ locations, suggestedMileage, onClose, onSave }) {
           value={category} onChange={setCategory}
           businessType={businessType} onBusinessTypeChange={setBusinessType}
           client={client} onClientChange={setClient}
+          clients={clients} onAddClient={onAddClient}
         />
       </Field>
       <Field label="Purpose (optional)"><input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Site inspection" className={inputClsPlain} /></Field>
@@ -1377,7 +1948,318 @@ function EndTripModal({ trip, locations, onClose, onSave }) {
   );
 }
 
-function FullTripModal({ locations, initial, onClose, onSave, onDelete }) {
+function TimeOnModal({ clients, onAddClient, onClose, onStart }) {
+  const [businessType, setBusinessType] = useState("chargeable");
+  const [client, setClient] = useState("");
+  const [jobNumber, setJobNumber] = useState("");
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [error, setError] = useState("");
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    setClient(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
+  function submit() {
+    if (businessType === "chargeable" && !client) return setError("Pick a client, or add a new one.");
+    setError("");
+    onStart({ category: "business", businessType, client, jobNumber });
+  }
+
+  return (
+    <Modal
+      title="Time On"
+      onClose={onClose}
+      footer={
+        <button onClick={submit} className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold text-sm active:scale-95 transition-transform">
+          Start timer
+        </button>
+      }
+    >
+      <Field label="Type">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setBusinessType("admin")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            Admin
+          </button>
+          <button
+            onClick={() => setBusinessType("chargeable")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            <Receipt size={14} /> Chargeable
+          </button>
+        </div>
+      </Field>
+      {businessType === "chargeable" && !addingNew && (
+        <Field label="Client">
+          <select
+            value={clients.includes(client) ? client : ""}
+            onChange={(e) => {
+              if (e.target.value === "__add_new__") setAddingNew(true);
+              else setClient(e.target.value);
+            }}
+            className={inputClsPlain}
+          >
+            <option value="">Select client…</option>
+            {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__add_new__">+ Add new client…</option>
+          </select>
+        </Field>
+      )}
+      {businessType === "chargeable" && addingNew && (
+        <Field label="New client">
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={newClientName}
+              onChange={(e) => setNewClientName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+              placeholder="Client name"
+              className={inputClsPlain}
+            />
+            <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
+            <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
+          </div>
+        </Field>
+      )}
+      <Field label="Job number (optional)">
+        <input
+          value={jobNumber}
+          onChange={(e) => setJobNumber(e.target.value)}
+          placeholder="e.g. 4521 — leave blank if not generated yet"
+          className={inputClsPlain}
+        />
+      </Field>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Manual add/edit for a work session — the backfill counterpart to Time
+// On/Off, for a job you did but forgot to (or couldn't) toggle live.
+function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onAddClient }) {
+  const [onDate, setOnDate] = useState(initial?.onDate || todayStr());
+  const [onTime, setOnTime] = useState(initial?.onTime || nowTimeStr());
+  const [offDate, setOffDate] = useState(initial?.offDate || initial?.onDate || todayStr());
+  const [offTime, setOffTime] = useState(initial?.offTime || nowTimeStr());
+  const [businessType, setBusinessType] = useState(initial?.businessType || "chargeable");
+  const [client, setClient] = useState(initial?.client || "");
+  const [jobNumber, setJobNumber] = useState(initial?.jobNumber || "");
+  const [addingNew, setAddingNew] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [error, setError] = useState("");
+
+  const hrs = onDate && onTime && offDate && offTime
+    ? (new Date(`${offDate}T${offTime}`) - new Date(`${onDate}T${onTime}`)) / 3600000
+    : null;
+
+  function commitNewClient() {
+    const trimmed = newClientName.trim();
+    if (!trimmed) return;
+    onAddClient(trimmed);
+    setClient(trimmed);
+    setNewClientName("");
+    setAddingNew(false);
+  }
+
+  function submit() {
+    if (businessType === "chargeable" && !client) return setError("Pick a client, or add a new one.");
+    if (hrs === null || hrs <= 0) return setError("Time off must be after time on.");
+    setError("");
+    onSave({
+      onDate, onTime, offDate, offTime,
+      category: "business", businessType,
+      client: businessType === "chargeable" ? client : "",
+      jobNumber,
+    });
+  }
+
+  return (
+    <Modal
+      title={initial ? "Edit Work Session" : "Log a Work Session"}
+      onClose={onClose}
+      bgImage={bgForCategory("business", businessType)}
+      footer={
+        <div>
+          {hrs !== null && hrs > 0 && (
+            <div className="text-center mb-3">
+              <span className="font-odo text-2xl font-bold text-sky-400">{formatDuration(Math.round(hrs * 60))}</span>
+            </div>
+          )}
+          <button onClick={submit} className="w-full py-3.5 rounded-xl bg-sky-400 text-slate-950 font-bold flex items-center justify-center gap-2 mb-2">
+            <Check size={16} /> {initial ? "Save Changes" : "Add Session"}
+          </button>
+          {onDelete && (
+            <button onClick={onDelete} className="w-full py-2.5 rounded-xl bg-rose-400/10 border border-rose-400/30 text-rose-400 font-semibold text-sm flex items-center justify-center gap-2">
+              <Trash2 size={14} /> Delete Session
+            </button>
+          )}
+        </div>
+      }
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="On date"><input type="date" value={onDate} onChange={(e) => setOnDate(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="On time"><input type="time" value={onTime} onChange={(e) => setOnTime(e.target.value)} className={inputCls} /></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Off date"><input type="date" value={offDate} onChange={(e) => setOffDate(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="Off time"><input type="time" value={offTime} onChange={(e) => setOffTime(e.target.value)} className={inputCls} /></Field>
+      </div>
+      <Field label="Type">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setBusinessType("admin")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            Admin
+          </button>
+          <button
+            onClick={() => setBusinessType("chargeable")}
+            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+          >
+            <Receipt size={14} /> Chargeable
+          </button>
+        </div>
+      </Field>
+      {businessType === "chargeable" && !addingNew && (
+        <Field label="Client">
+          <select
+            value={clients.includes(client) ? client : ""}
+            onChange={(e) => {
+              if (e.target.value === "__add_new__") setAddingNew(true);
+              else setClient(e.target.value);
+            }}
+            className={inputClsPlain}
+          >
+            <option value="">Select client…</option>
+            {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+            <option value="__add_new__">+ Add new client…</option>
+          </select>
+        </Field>
+      )}
+      {businessType === "chargeable" && addingNew && (
+        <Field label="New client">
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={newClientName}
+              onChange={(e) => setNewClientName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+              placeholder="Client name"
+              className={inputClsPlain}
+            />
+            <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
+            <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
+          </div>
+        </Field>
+      )}
+      <Field label="Job number (optional)">
+        <input
+          value={jobNumber}
+          onChange={(e) => setJobNumber(e.target.value)}
+          placeholder="e.g. 4521 — leave blank if not generated yet"
+          className={inputClsPlain}
+        />
+      </Field>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Bulk-import trips from a CSV matching this app's own export format —
+// intended for consolidating older mileage records (pre-dating this app)
+// into the same trip history everything else already uses.
+function ImportCsvModal({ onClose, onImport }) {
+  const [fileName, setFileName] = useState("");
+  const [parsed, setParsed] = useState(null); // { trips, errors }
+  const [result, setResult] = useState(null); // { imported, duplicates }
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    setResult(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rows = parseCsv(reader.result);
+      const { trips, errors } = csvRowsToTrips(rows);
+      setParsed({ trips, errors });
+    };
+    reader.readAsText(file);
+  }
+
+  function handleConfirm() {
+    if (!parsed || parsed.trips.length === 0) return;
+    setResult(onImport(parsed.trips));
+  }
+
+  return (
+    <Modal
+      title="Import trips from CSV"
+      onClose={onClose}
+      footer={
+        parsed && !result ? (
+          <button
+            onClick={handleConfirm}
+            disabled={parsed.trips.length === 0}
+            className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm disabled:opacity-50"
+          >
+            Import {parsed.trips.length} trip{parsed.trips.length === 1 ? "" : "s"}
+          </button>
+        ) : result ? (
+          <button onClick={onClose} className="w-full py-3.5 rounded-xl bg-slate-800 text-slate-200 font-semibold text-sm">
+            Done
+          </button>
+        ) : null
+      }
+    >
+      <div className="text-xs text-slate-500 mb-3">
+        Expects the same columns this app's own CSV export uses: Date, Time Out, From, Odometer Out,
+        Time In, To, Odometer In, KM, Category, Business Type, Client, Purpose, Job Number, Site
+        Notes. Trips matching one already in your log (same date, time out, and odometer out) are
+        skipped automatically — safe to run more than once on the same file.
+      </div>
+      <label className="block w-full py-8 rounded-xl border-2 border-dashed border-slate-700 text-center cursor-pointer mb-3">
+        <input type="file" accept=".csv,text/csv" onChange={handleFile} className="hidden" />
+        <Download size={20} className="text-slate-500 mx-auto mb-2 rotate-180" />
+        <div className="text-sm text-slate-300 font-medium">{fileName || "Tap to choose a CSV file"}</div>
+      </label>
+
+      {parsed && !result && (
+        <div className="rounded-xl bg-slate-800/50 p-3 mb-2">
+          <div className="text-sm text-slate-200 font-medium mb-1">
+            Found {parsed.trips.length} trip{parsed.trips.length === 1 ? "" : "s"} to import
+          </div>
+          {parsed.errors.length > 0 && (
+            <div className="text-xs text-amber-400">
+              {parsed.errors.length} row{parsed.errors.length === 1 ? "" : "s"} skipped, see below
+            </div>
+          )}
+        </div>
+      )}
+      {parsed && parsed.errors.length > 0 && !result && (
+        <div className="text-xs text-slate-500 max-h-32 overflow-y-auto space-y-1 mb-2">
+          {parsed.errors.map((e, i) => <div key={i}>{e}</div>)}
+        </div>
+      )}
+      {result && (
+        <div className="rounded-xl bg-emerald-400/10 border border-emerald-400/30 p-3 text-sm text-emerald-400">
+          Imported {result.imported} trip{result.imported === 1 ? "" : "s"}.
+          {result.duplicates > 0 && ` Skipped ${result.duplicates} already in your log.`}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients, onAddClient }) {
   const [date, setDate] = useState(initial?.date || todayStr());
   const [timeOut, setTimeOut] = useState(initial?.timeOut || nowTimeStr());
   const [mileageOut, setMileageOut] = useState(initial ? String(initial.mileageOut) : "");
@@ -1465,6 +2347,7 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete }) {
           value={category} onChange={setCategory}
           businessType={businessType} onBusinessTypeChange={setBusinessType}
           client={client} onClientChange={setClient}
+          clients={clients} onAddClient={onAddClient}
         />
       </Field>
       <Field label="Purpose (optional)"><input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Site inspection" className={inputClsPlain} /></Field>
