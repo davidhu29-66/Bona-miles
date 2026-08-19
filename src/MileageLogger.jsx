@@ -73,6 +73,86 @@ function fmtDateLong(dateStr) {
 function sortKey(t) {
   return `${t.date}T${t.timeOut || "00:00"}`;
 }
+
+// Minimal RFC4180-ish CSV parser — handles quoted fields containing commas,
+// quotes ("" escaping), and newlines, which the app's own CSV export
+// produces for Client/Purpose/Site Notes. Not a general-purpose parser, but
+// sufficient for round-tripping this app's own export format.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => { pushField(); rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      pushField();
+    } else if (c === "\n") {
+      if (field !== "" || row.length > 0) pushRow();
+    } else if (c === "\r") {
+      // ignore, \n handles the row break
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) pushRow();
+  return rows.filter((r) => r.length > 1 || r[0] !== "");
+}
+
+const IMPORT_HEADER = ["Date", "Time Out", "From", "Odometer Out", "Time In", "To", "Odometer In", "KM", "Category", "Business Type", "Client", "Purpose", "Job Number", "Site Notes"];
+
+// Turns parsed CSV rows into trip objects, matching exportCsv()'s column
+// order exactly. Returns { trips, errors } — malformed rows are skipped and
+// reported by row number rather than aborting the whole import.
+function csvRowsToTrips(rows) {
+  const trips = [];
+  const errors = [];
+  const headerRow = rows[0] || [];
+  const looksLikeHeader = headerRow[0] && headerRow[0].trim().toLowerCase() === "date";
+  const dataRows = looksLikeHeader ? rows.slice(1) : rows;
+  const startLine = looksLikeHeader ? 2 : 1;
+
+  dataRows.forEach((cols, i) => {
+    const lineNum = startLine + i;
+    if (cols.length < 8) { errors.push(`Row ${lineNum}: too few columns, skipped.`); return; }
+    const [date, timeOut, fromLocation, mileageOutRaw, timeIn, toLocation, mileageInRaw, , category, businessType, client, purpose, jobNumber, siteNotes] = cols;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test((date || "").trim())) { errors.push(`Row ${lineNum}: date "${date}" isn't YYYY-MM-DD, skipped.`); return; }
+    const mileageOut = Number(mileageOutRaw);
+    const mileageIn = Number(mileageInRaw);
+    if (!Number.isFinite(mileageOut) || !Number.isFinite(mileageIn)) { errors.push(`Row ${lineNum}: odometer values aren't numbers, skipped.`); return; }
+    if (mileageIn < mileageOut) { errors.push(`Row ${lineNum}: odometer in is less than odometer out, skipped.`); return; }
+    if (!fromLocation || !toLocation) { errors.push(`Row ${lineNum}: missing From/To location, skipped.`); return; }
+    const cat = (category || "").trim().toLowerCase() === "private" ? "private" : "business";
+    trips.push({
+      id: uid(),
+      date: date.trim(),
+      timeOut: (timeOut || "00:00").trim(),
+      mileageOut,
+      fromLocation: fromLocation.trim(),
+      timeIn: (timeIn || "00:00").trim(),
+      mileageIn,
+      toLocation: toLocation.trim(),
+      category: cat,
+      businessType: cat === "business" ? ((businessType || "").trim() === "chargeable" ? "chargeable" : "admin") : null,
+      client: cat === "business" ? (client || "").trim() : "",
+      purpose: (purpose || "").trim(),
+      jobNumber: (jobNumber || "").trim(),
+      siteNotes: (siteNotes || "").trim(),
+    });
+  });
+  return { trips, errors };
+}
 function monthLabel(ym) {
   const [y, m] = ym.split("-");
   const d = new Date(Number(y), Number(m) - 1, 1);
@@ -162,6 +242,7 @@ export default function MileageLogger() {
   const [showStart, setShowStart] = useState(false);
   const [showEnd, setShowEnd] = useState(false);
   const [showTimeOn, setShowTimeOn] = useState(false);
+  const [showImportCsv, setShowImportCsv] = useState(false);
   const [showFull, setShowFull] = useState(false);
   const [editingTrip, setEditingTrip] = useState(null);
   const [showFullSession, setShowFullSession] = useState(false);
@@ -490,6 +571,35 @@ export default function MileageLogger() {
     syncToNodeRed({ event: "trip_completed", trip: updated });
   }
 
+  // Dedup fingerprint: same date+timeOut+mileageOut is treated as "already
+  // logged" — safe to re-run an import without creating duplicates.
+  function importTripsCsv(parsedTrips) {
+    const existingKeys = new Set(trips.map((t) => `${t.date}|${t.timeOut}|${t.mileageOut}`));
+    const newTrips = [];
+    let duplicates = 0;
+    for (const t of parsedTrips) {
+      const key = `${t.date}|${t.timeOut}|${t.mileageOut}`;
+      if (existingKeys.has(key)) { duplicates++; continue; }
+      existingKeys.add(key);
+      newTrips.push(t);
+    }
+    if (newTrips.length > 0) {
+      persistTrips([...trips, ...newTrips]);
+      const newLocationNames = new Set();
+      const newClientNames = new Set();
+      newTrips.forEach((t) => {
+        newLocationNames.add(t.fromLocation);
+        newLocationNames.add(t.toLocation);
+        if (t.client) newClientNames.add(t.client);
+      });
+      newLocationNames.forEach((name) => {
+        if (!locations.some((l) => l.name === name)) upsertLocation(name);
+      });
+      newClientNames.forEach((name) => upsertClient(name));
+    }
+    return { imported: newTrips.length, duplicates };
+  }
+
   function saveFullTrip(data, existingId) {
     if (existingId) {
       let updated = null;
@@ -653,6 +763,7 @@ export default function MileageLogger() {
             onTimesheetRegionChange={(v) => persistSettings({ timesheetRegion: v })}
             onGenerateTimesheet={handleGenerateTimesheet}
             generatingTimesheet={generatingTimesheet}
+            onOpenImport={() => setShowImportCsv(true)}
           />
         )}
       </main>
@@ -705,6 +816,12 @@ export default function MileageLogger() {
           onDelete={editingSession ? () => setConfirmDelete({ id: editingSession.id, type: "session" }) : null}
           clients={clients}
           onAddClient={upsertClient}
+        />
+      )}
+      {showImportCsv && (
+        <ImportCsvModal
+          onClose={() => setShowImportCsv(false)}
+          onImport={importTripsCsv}
         />
       )}
       {confirmDelete && (
@@ -1236,7 +1353,7 @@ function SettingsTab({
   nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
   clients, onAddClient, onRemoveClient,
   timesheetName, timesheetRegion, onTimesheetNameChange, onTimesheetRegionChange,
-  onGenerateTimesheet, generatingTimesheet,
+  onGenerateTimesheet, generatingTimesheet, onOpenImport,
 }) {
   const [newLoc, setNewLoc] = useState("");
   const [newClient, setNewClient] = useState("");
@@ -1449,6 +1566,12 @@ function SettingsTab({
         <div className="text-xs text-slate-500 mb-3">
           {trips.length} trip{trips.length === 1 ? "" : "s"} stored, saved automatically as you go.
         </div>
+        <button
+          onClick={onOpenImport}
+          className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-300 text-sm font-medium flex items-center justify-center gap-2 mb-2"
+        >
+          <Download size={14} className="rotate-180" /> Import trips from CSV
+        </button>
         {typeof window !== "undefined" && window.appSignOut && (
           <button
             onClick={() => window.appSignOut()}
@@ -2046,6 +2169,92 @@ function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onA
         />
       </Field>
       {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Bulk-import trips from a CSV matching this app's own export format —
+// intended for consolidating older mileage records (pre-dating this app)
+// into the same trip history everything else already uses.
+function ImportCsvModal({ onClose, onImport }) {
+  const [fileName, setFileName] = useState("");
+  const [parsed, setParsed] = useState(null); // { trips, errors }
+  const [result, setResult] = useState(null); // { imported, duplicates }
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    setResult(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rows = parseCsv(reader.result);
+      const { trips, errors } = csvRowsToTrips(rows);
+      setParsed({ trips, errors });
+    };
+    reader.readAsText(file);
+  }
+
+  function handleConfirm() {
+    if (!parsed || parsed.trips.length === 0) return;
+    setResult(onImport(parsed.trips));
+  }
+
+  return (
+    <Modal
+      title="Import trips from CSV"
+      onClose={onClose}
+      footer={
+        parsed && !result ? (
+          <button
+            onClick={handleConfirm}
+            disabled={parsed.trips.length === 0}
+            className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm disabled:opacity-50"
+          >
+            Import {parsed.trips.length} trip{parsed.trips.length === 1 ? "" : "s"}
+          </button>
+        ) : result ? (
+          <button onClick={onClose} className="w-full py-3.5 rounded-xl bg-slate-800 text-slate-200 font-semibold text-sm">
+            Done
+          </button>
+        ) : null
+      }
+    >
+      <div className="text-xs text-slate-500 mb-3">
+        Expects the same columns this app's own CSV export uses: Date, Time Out, From, Odometer Out,
+        Time In, To, Odometer In, KM, Category, Business Type, Client, Purpose, Job Number, Site
+        Notes. Trips matching one already in your log (same date, time out, and odometer out) are
+        skipped automatically — safe to run more than once on the same file.
+      </div>
+      <label className="block w-full py-8 rounded-xl border-2 border-dashed border-slate-700 text-center cursor-pointer mb-3">
+        <input type="file" accept=".csv,text/csv" onChange={handleFile} className="hidden" />
+        <Download size={20} className="text-slate-500 mx-auto mb-2 rotate-180" />
+        <div className="text-sm text-slate-300 font-medium">{fileName || "Tap to choose a CSV file"}</div>
+      </label>
+
+      {parsed && !result && (
+        <div className="rounded-xl bg-slate-800/50 p-3 mb-2">
+          <div className="text-sm text-slate-200 font-medium mb-1">
+            Found {parsed.trips.length} trip{parsed.trips.length === 1 ? "" : "s"} to import
+          </div>
+          {parsed.errors.length > 0 && (
+            <div className="text-xs text-amber-400">
+              {parsed.errors.length} row{parsed.errors.length === 1 ? "" : "s"} skipped, see below
+            </div>
+          )}
+        </div>
+      )}
+      {parsed && parsed.errors.length > 0 && !result && (
+        <div className="text-xs text-slate-500 max-h-32 overflow-y-auto space-y-1 mb-2">
+          {parsed.errors.map((e, i) => <div key={i}>{e}</div>)}
+        </div>
+      )}
+      {result && (
+        <div className="rounded-xl bg-emerald-400/10 border border-emerald-400/30 p-3 text-sm text-emerald-400">
+          Imported {result.imported} trip{result.imported === 1 ? "" : "s"}.
+          {result.duplicates > 0 && ` Skipped ${result.duplicates} already in your log.`}
+        </div>
+      )}
     </Modal>
   );
 }
