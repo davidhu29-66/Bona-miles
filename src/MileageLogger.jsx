@@ -3,7 +3,7 @@ import {
   Gauge, Clock, Plus, X, Trash2, Settings as SettingsIcon,
   List, BarChart3, ChevronLeft, ChevronRight, Briefcase, Home as HomeIcon,
   Download, ArrowRight, AlertTriangle, Check, Car, LocateFixed, MapPin, Receipt,
-  Radio, Send, FileSpreadsheet,
+  FileSpreadsheet, SplitSquareHorizontal,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
@@ -232,8 +232,6 @@ export default function MileageLogger() {
   const [clients, setClients] = useState([]);
   const [workSessions, setWorkSessions] = useState([]);
   const [activeTimer, setActiveTimer] = useState(null);
-  const [nodeRedUrl, setNodeRedUrl] = useState("");
-  const [nodeRedEnabled, setNodeRedEnabled] = useState(false);
   const [timesheetName, setTimesheetName] = useState("");
   const [timesheetRegion, setTimesheetRegion] = useState("");
   const [tab, setTab] = useState("log");
@@ -307,8 +305,6 @@ export default function MileageLogger() {
       try {
         const res = await window.storage.get("settings", false);
         const s = res ? JSON.parse(res.value) : {};
-        setNodeRedUrl(s.nodeRedUrl || "");
-        setNodeRedEnabled(!!s.nodeRedEnabled);
         setTimesheetName(s.timesheetName || "");
         setTimesheetRegion(s.timesheetRegion || "");
       } catch (e) {
@@ -396,7 +392,6 @@ export default function MileageLogger() {
     };
     persistActiveTimer(timer);
     showToast("success", `Time on — ${timer.businessType === "chargeable" ? timer.client || "Chargeable" : "Admin"}.`);
-    syncToNodeRed({ event: "time_on", timer });
   }
 
   function timeOff() {
@@ -409,7 +404,6 @@ export default function MileageLogger() {
     persistWorkSessions([...workSessions, session]);
     persistActiveTimer(null);
     showToast("success", "Time off — session logged.");
-    syncToNodeRed({ event: "time_off", session });
   }
 
   const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
@@ -441,9 +435,7 @@ export default function MileageLogger() {
   }
 
   async function persistSettings(next) {
-    const merged = { nodeRedUrl, nodeRedEnabled, timesheetName, timesheetRegion, ...next };
-    if ("nodeRedUrl" in next) setNodeRedUrl(next.nodeRedUrl);
-    if ("nodeRedEnabled" in next) setNodeRedEnabled(next.nodeRedEnabled);
+    const merged = { timesheetName, timesheetRegion, ...next };
     if ("timesheetName" in next) setTimesheetName(next.timesheetName);
     if ("timesheetRegion" in next) setTimesheetRegion(next.timesheetRegion);
     try {
@@ -453,35 +445,6 @@ export default function MileageLogger() {
     }
   }
 
-  // Best-effort push to a Node-RED HTTP-in endpoint. Never blocks trip saving
-  // and never surfaces its own errors as a save failure — logging a trip
-  // should always succeed locally even if the webhook is unreachable (site's
-  // offline, Node-RED restarting, wrong LAN IP, etc). Returns true/false so the
-  // Settings screen's "Send test ping" button can report success explicitly.
-  //
-  // Content-Type is deliberately "text/plain", not "application/json" — the
-  // body is still a JSON string, but application/json makes this a
-  // CORS-"non-simple" request, which triggers a preflight OPTIONS check.
-  // Node-RED's core "http in" node cannot register an OPTIONS route at all
-  // (it's genuinely not in the node — not a config thing), so that preflight
-  // always 404s and the browser blocks the real POST before it ever reaches
-  // Node-RED. text/plain is a CORS-"simple" content type, so it skips
-  // preflight entirely. The receiving flow does JSON.parse(msg.payload).
-  async function syncToNodeRed(payload, { force = false } = {}) {
-    if (!force && !nodeRedEnabled) return false;
-    if (!nodeRedUrl.trim()) return false;
-    try {
-      const res = await fetch(nodeRedUrl.trim(), {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: JSON.stringify({ ...payload, sentAt: new Date().toISOString() }),
-      });
-      return res.ok;
-    } catch (e) {
-      console.warn("Node-RED sync failed:", e);
-      return false;
-    }
-  }
 
   const sortedTrips = useMemo(
     () => [...trips].sort((a, b) => (sortKey(a) < sortKey(b) ? 1 : -1)),
@@ -554,7 +517,6 @@ export default function MileageLogger() {
     upsertLocation(data.fromLocation, data.fromLocationCoords?.lat, data.fromLocationCoords?.lng);
     setShowStart(false);
     showToast("success", "Trip started — safe driving.");
-    syncToNodeRed({ event: "trip_started", trip });
   }
 
   function endTrip(id, data) {
@@ -568,7 +530,6 @@ export default function MileageLogger() {
     upsertLocation(data.toLocation, data.toLocationCoords?.lat, data.toLocationCoords?.lng);
     setShowEnd(false);
     showToast("success", "Trip logged.");
-    syncToNodeRed({ event: "trip_completed", trip: updated });
   }
 
   // Dedup fingerprint: same date+timeOut+mileageOut is treated as "already
@@ -625,7 +586,6 @@ export default function MileageLogger() {
       });
       persistTrips(next);
       showToast("success", "Trip updated.");
-      syncToNodeRed({ event: "trip_updated", trip: updated });
     } else {
       const trip = {
         id: uid(),
@@ -645,7 +605,6 @@ export default function MileageLogger() {
       };
       persistTrips([...trips, trip]);
       showToast("success", "Trip added.");
-      syncToNodeRed({ event: "trip_completed", trip });
     }
     upsertLocation(data.fromLocation, data.fromLocationCoords?.lat, data.fromLocationCoords?.lng);
     upsertLocation(data.toLocation, data.toLocationCoords?.lat, data.toLocationCoords?.lng);
@@ -657,7 +616,6 @@ export default function MileageLogger() {
     persistTrips(trips.filter((t) => t.id !== id));
     setConfirmDelete(null);
     showToast("success", "Trip deleted.");
-    syncToNodeRed({ event: "trip_deleted", tripId: id });
   }
 
   function saveFullWorkSession(data, existingId) {
@@ -670,12 +628,10 @@ export default function MileageLogger() {
       });
       persistWorkSessions(next);
       showToast("success", "Work session updated.");
-      syncToNodeRed({ event: "time_off", session: updated });
     } else {
       const session = { id: uid(), ...data };
       persistWorkSessions([...workSessions, session]);
       showToast("success", "Work session added.");
-      syncToNodeRed({ event: "time_off", session });
     }
     setShowFullSession(false);
     setEditingSession(null);
@@ -685,7 +641,6 @@ export default function MileageLogger() {
     persistWorkSessions(workSessions.filter((s) => s.id !== id));
     setConfirmDelete(null);
     showToast("success", "Work session deleted.");
-    syncToNodeRed({ event: "session_deleted", sessionId: id });
   }
 
   if (loading) {
@@ -748,12 +703,6 @@ export default function MileageLogger() {
             onRemoveLocation={(name) => persistLocations(locations.filter((l) => l.name !== name))}
             onPinLocation={(name, lat, lng) => upsertLocation(name, lat, lng)}
             trips={trips}
-            nodeRedUrl={nodeRedUrl}
-            nodeRedEnabled={nodeRedEnabled}
-            onNodeRedUrlChange={(url) => persistSettings({ nodeRedUrl: url })}
-            onNodeRedEnabledChange={(enabled) => persistSettings({ nodeRedEnabled: enabled })}
-            onTestPing={() => syncToNodeRed({ event: "test", message: "Hello from Mileage Logger" }, { force: true })}
-            onSyncAll={() => syncToNodeRed({ event: "full_sync", trips }, { force: true })}
             clients={clients}
             onAddClient={upsertClient}
             onRemoveClient={(name) => persistClients(clients.filter((c) => c !== name))}
@@ -988,17 +937,20 @@ function ElapsedTime({ sinceDate, sinceTime }) {
 }
 
 function TripRow({ trip, onClick, compact }) {
+  const isSplit = trip.splits && trip.splits.length > 0;
   const isBiz = trip.category === "business";
   const isChargeable = isBiz && trip.businessType === "chargeable";
   const km = trip.mileageIn !== null ? trip.mileageIn - trip.mileageOut : null;
-  const iconWrapCls = isChargeable ? "bg-sky-400/10" : isBiz ? "bg-emerald-400/10" : "bg-rose-400/10";
+  const iconWrapCls = isSplit ? "bg-amber-400/10" : isChargeable ? "bg-sky-400/10" : isBiz ? "bg-emerald-400/10" : "bg-rose-400/10";
   return (
     <button
       onClick={onClick}
       className="w-full text-left rounded-xl bg-slate-800/50 hover:bg-slate-800 border border-slate-800 p-3 flex items-center gap-3 transition-colors"
     >
       <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${iconWrapCls}`}>
-        {isChargeable ? (
+        {isSplit ? (
+          <SplitSquareHorizontal size={15} className="text-amber-400" />
+        ) : isChargeable ? (
           <Receipt size={15} className="text-sky-400" />
         ) : isBiz ? (
           <Briefcase size={15} className="text-emerald-400" />
@@ -1014,12 +966,18 @@ function TripRow({ trip, onClick, compact }) {
         </div>
         <div className="text-xs text-slate-500">
           {fmtDateLong(trip.date)}{!compact ? ` · ${trip.timeOut}–${trip.timeIn || "…"}` : ""}
-          {isBiz && trip.businessType && (
-            <span className={isChargeable ? "text-sky-400" : "text-slate-500"}>
-              {" "}· {isChargeable ? `Chargeable${trip.client ? " — " + trip.client : ""}` : "Admin"}
-            </span>
+          {isSplit ? (
+            <span className="text-amber-400"> · Split {trip.splits.length} ways</span>
+          ) : (
+            <>
+              {isBiz && trip.businessType && (
+                <span className={isChargeable ? "text-sky-400" : "text-slate-500"}>
+                  {" "}· {isChargeable ? `Chargeable${trip.client ? " — " + trip.client : ""}` : "Admin"}
+                </span>
+              )}
+              {trip.jobNumber && <span className="text-amber-400"> · Job #{trip.jobNumber}</span>}
+            </>
           )}
-          {trip.jobNumber && <span className="text-amber-400"> · Job #{trip.jobNumber}</span>}
         </div>
       </div>
       <div className="text-right shrink-0">
@@ -1031,6 +989,7 @@ function TripRow({ trip, onClick, compact }) {
 }
 
 function SessionRow({ session, onClick, compact }) {
+  const isSplit = session.splits && session.splits.length > 0;
   const isChargeable = session.businessType === "chargeable";
   const hrs = session.onDate && session.onTime && session.offDate && session.offTime
     ? (new Date(`${session.offDate}T${session.offTime}`) - new Date(`${session.onDate}T${session.onTime}`)) / 3600000
@@ -1040,16 +999,24 @@ function SessionRow({ session, onClick, compact }) {
       onClick={onClick}
       className="w-full text-left rounded-xl bg-slate-800/50 hover:bg-slate-800 border border-slate-800 p-3 flex items-center gap-3 transition-colors"
     >
-      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${isChargeable ? "bg-sky-400/10" : "bg-slate-700/40"}`}>
-        <Clock size={15} className={isChargeable ? "text-sky-400" : "text-slate-400"} />
+      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${isSplit ? "bg-amber-400/10" : isChargeable ? "bg-sky-400/10" : "bg-slate-700/40"}`}>
+        {isSplit ? (
+          <SplitSquareHorizontal size={15} className="text-amber-400" />
+        ) : (
+          <Clock size={15} className={isChargeable ? "text-sky-400" : "text-slate-400"} />
+        )}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1 text-sm font-medium text-slate-100 truncate">
-          {isChargeable ? (session.client || "Chargeable") : "Admin"}
+          {isSplit ? "Split session" : isChargeable ? (session.client || "Chargeable") : "Admin"}
         </div>
         <div className="text-xs text-slate-500">
           {fmtDateLong(session.onDate)}{!compact ? ` · ${session.onTime}–${session.offTime}` : ""}
-          {session.jobNumber && <span className="text-amber-400"> · Job #{session.jobNumber}</span>}
+          {isSplit ? (
+            <span className="text-amber-400"> · {session.splits.length} ways</span>
+          ) : (
+            session.jobNumber && <span className="text-amber-400"> · Job #{session.jobNumber}</span>
+          )}
         </div>
       </div>
       <div className="text-right shrink-0">
@@ -1350,7 +1317,6 @@ function StatCard({ label, value, sub, accent }) {
 
 function SettingsTab({
   locations, onAddLocation, onRemoveLocation, onPinLocation, trips,
-  nodeRedUrl, nodeRedEnabled, onNodeRedUrlChange, onNodeRedEnabledChange, onTestPing, onSyncAll,
   clients, onAddClient, onRemoveClient,
   timesheetName, timesheetRegion, onTimesheetNameChange, onTimesheetRegionChange,
   onGenerateTimesheet, generatingTimesheet, onOpenImport,
@@ -1359,9 +1325,6 @@ function SettingsTab({
   const [newClient, setNewClient] = useState("");
   const [pinningName, setPinningName] = useState(null);
   const [pinError, setPinError] = useState("");
-  const [urlDraft, setUrlDraft] = useState(nodeRedUrl);
-  const [pingStatus, setPingStatus] = useState(null); // null | "sending" | "ok" | "fail"
-  const [syncStatus, setSyncStatus] = useState(null);
   const [nameDraft, setNameDraft] = useState(timesheetName);
   const [regionDraft, setRegionDraft] = useState(timesheetRegion);
 
@@ -1375,20 +1338,6 @@ function SettingsTab({
       setPinError(`Couldn't get your location for "${name}".`);
     }
     setPinningName(null);
-  }
-
-  async function handleTestPing() {
-    setPingStatus("sending");
-    const ok = await onTestPing();
-    setPingStatus(ok ? "ok" : "fail");
-    setTimeout(() => setPingStatus(null), 3000);
-  }
-
-  async function handleSyncAll() {
-    setSyncStatus("sending");
-    const ok = await onSyncAll();
-    setSyncStatus(ok ? "ok" : "fail");
-    setTimeout(() => setSyncStatus(null), 3000);
   }
 
   return (
@@ -1505,60 +1454,6 @@ function SettingsTab({
         >
           <FileSpreadsheet size={16} /> {generatingTimesheet ? "Generating…" : "Generate last week's timesheet"}
         </button>
-      </div>
-
-      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
-        <div className="flex items-center justify-between mb-1">
-          <div className="text-sm font-semibold text-slate-300 flex items-center gap-1.5">
-            <Radio size={14} className="text-sky-400" /> Node-RED sync
-          </div>
-          <button
-            onClick={() => onNodeRedEnabledChange(!nodeRedEnabled)}
-            className={`w-11 h-6 rounded-full shrink-0 flex items-center px-0.5 transition-colors ${nodeRedEnabled ? "bg-emerald-500 justify-end" : "bg-slate-700 justify-start"}`}
-          >
-            <span className="w-5 h-5 rounded-full bg-white" />
-          </button>
-        </div>
-        <div className="text-xs text-slate-500 mb-3">
-          When enabled, every trip start/end/edit/delete gets POSTed as JSON to an HTTP-in node on your
-          flow — point it at whatever endpoint your Node-RED instance exposes. Runs best-effort in the
-          background; trips still save locally even if the webhook is unreachable.
-        </div>
-        <Field label="Webhook URL">
-          <input
-            value={urlDraft}
-            onChange={(e) => setUrlDraft(e.target.value)}
-            onBlur={() => onNodeRedUrlChange(urlDraft)}
-            placeholder="http://192.168.1.50:1880/mileage"
-            className="w-full bg-slate-800 border border-slate-700 rounded-xl px-3 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-sky-400/50 font-mono"
-            inputMode="url"
-            autoCapitalize="none"
-            autoCorrect="off"
-          />
-        </Field>
-        <div className="grid grid-cols-2 gap-2 mt-1">
-          <button
-            onClick={handleTestPing}
-            disabled={!urlDraft.trim() || pingStatus === "sending"}
-            className="py-2.5 rounded-xl bg-slate-800 text-slate-200 text-sm font-medium flex items-center justify-center gap-2 active:scale-95 disabled:opacity-40"
-          >
-            <Send size={13} />
-            {pingStatus === "sending" ? "Sending…" : pingStatus === "ok" ? "Sent ✓" : pingStatus === "fail" ? "Failed" : "Send test ping"}
-          </button>
-          <button
-            onClick={handleSyncAll}
-            disabled={!urlDraft.trim() || syncStatus === "sending"}
-            className="py-2.5 rounded-xl bg-sky-400/10 border border-sky-400/30 text-sky-400 text-sm font-medium flex items-center justify-center gap-2 active:scale-95 disabled:opacity-40"
-          >
-            <Radio size={13} />
-            {syncStatus === "sending" ? "Syncing…" : syncStatus === "ok" ? "Synced ✓" : syncStatus === "fail" ? "Failed" : `Sync all ${trips.length}`}
-          </button>
-        </div>
-        {(pingStatus === "fail" || syncStatus === "fail") && (
-          <div className="text-rose-400 text-xs flex items-center gap-1.5 mt-2">
-            <AlertTriangle size={13} /> Couldn't reach that URL — check the address and that Node-RED's HTTP-in node allows requests from this browser (CORS).
-          </div>
-        )}
       </div>
 
       <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
@@ -2054,11 +1949,14 @@ function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onA
   const [jobNumber, setJobNumber] = useState(initial?.jobNumber || "");
   const [addingNew, setAddingNew] = useState(false);
   const [newClientName, setNewClientName] = useState("");
+  const [splitMode, setSplitMode] = useState(!!(initial?.splits && initial.splits.length > 0));
+  const [splits, setSplits] = useState(initial?.splits || []);
   const [error, setError] = useState("");
 
   const hrs = onDate && onTime && offDate && offTime
     ? (new Date(`${offDate}T${offTime}`) - new Date(`${onDate}T${onTime}`)) / 3600000
     : null;
+  const hrsRounded = hrs !== null ? Math.round(hrs * 4) / 4 : null;
 
   function commitNewClient() {
     const trimmed = newClientName.trim();
@@ -2070,14 +1968,23 @@ function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onA
   }
 
   function submit() {
-    if (businessType === "chargeable" && !client) return setError("Pick a client, or add a new one.");
     if (hrs === null || hrs <= 0) return setError("Time off must be after time on.");
+    if (splitMode) {
+      if (splits.length === 0) return setError("Add at least one split, or turn split off.");
+      const allocated = splits.reduce((sum, s) => sum + (Number(s.amount) || 0), 0);
+      if (Math.abs(allocated - hrsRounded) > 0.26) return setError(`Splits total ${allocated}h, but the session is ${hrsRounded}h — adjust so they match.`);
+      if (splits.some((s) => s.businessType === "chargeable" && !s.client)) return setError("Every chargeable split needs a client.");
+    } else if (businessType === "chargeable" && !client) {
+      return setError("Pick a client, or add a new one.");
+    }
     setError("");
     onSave({
       onDate, onTime, offDate, offTime,
-      category: "business", businessType,
-      client: businessType === "chargeable" ? client : "",
-      jobNumber,
+      category: "business",
+      businessType: splitMode ? null : businessType,
+      client: splitMode ? "" : (businessType === "chargeable" ? client : ""),
+      jobNumber: splitMode ? "" : jobNumber,
+      splits: splitMode ? splits.map((s) => ({ ...s, amount: Number(s.amount) || 0 })) : [],
     });
   }
 
@@ -2112,62 +2019,79 @@ function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onA
         <Field label="Off date"><input type="date" value={offDate} onChange={(e) => setOffDate(e.target.value)} className={inputClsPlain} /></Field>
         <Field label="Off time"><input type="time" value={offTime} onChange={(e) => setOffTime(e.target.value)} className={inputCls} /></Field>
       </div>
-      <Field label="Type">
-        <div className="flex gap-2">
-          <button
-            onClick={() => setBusinessType("admin")}
-            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
-          >
-            Admin
-          </button>
-          <button
-            onClick={() => setBusinessType("chargeable")}
-            className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
-          >
-            <Receipt size={14} /> Chargeable
-          </button>
-        </div>
-      </Field>
-      {businessType === "chargeable" && !addingNew && (
-        <Field label="Client">
-          <select
-            value={clients.includes(client) ? client : ""}
-            onChange={(e) => {
-              if (e.target.value === "__add_new__") setAddingNew(true);
-              else setClient(e.target.value);
-            }}
-            className={inputClsPlain}
-          >
-            <option value="">Select client…</option>
-            {clients.map((c) => <option key={c} value={c}>{c}</option>)}
-            <option value="__add_new__">+ Add new client…</option>
-          </select>
-        </Field>
-      )}
-      {businessType === "chargeable" && addingNew && (
-        <Field label="New client">
-          <div className="flex gap-2">
+      {!splitMode ? (
+        <>
+          <Field label="Type">
+            <div className="flex gap-2">
+              <button
+                onClick={() => setBusinessType("admin")}
+                className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold ${businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+              >
+                Admin
+              </button>
+              <button
+                onClick={() => setBusinessType("chargeable")}
+                className={`flex-1 py-2.5 rounded-xl border text-sm font-semibold flex items-center justify-center gap-1.5 ${businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+              >
+                <Receipt size={14} /> Chargeable
+              </button>
+            </div>
+          </Field>
+          {businessType === "chargeable" && !addingNew && (
+            <Field label="Client">
+              <select
+                value={clients.includes(client) ? client : ""}
+                onChange={(e) => {
+                  if (e.target.value === "__add_new__") setAddingNew(true);
+                  else setClient(e.target.value);
+                }}
+                className={inputClsPlain}
+              >
+                <option value="">Select client…</option>
+                {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+                <option value="__add_new__">+ Add new client…</option>
+              </select>
+            </Field>
+          )}
+          {businessType === "chargeable" && addingNew && (
+            <Field label="New client">
+              <div className="flex gap-2">
+                <input
+                  autoFocus
+                  value={newClientName}
+                  onChange={(e) => setNewClientName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
+                  placeholder="Client name"
+                  className={inputClsPlain}
+                />
+                <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
+                <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
+              </div>
+            </Field>
+          )}
+          <Field label="Job number (optional)">
             <input
-              autoFocus
-              value={newClientName}
-              onChange={(e) => setNewClientName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && commitNewClient()}
-              placeholder="Client name"
+              value={jobNumber}
+              onChange={(e) => setJobNumber(e.target.value)}
+              placeholder="e.g. 4521 — leave blank if not generated yet"
               className={inputClsPlain}
             />
-            <button onClick={commitNewClient} className="px-3 rounded-xl bg-amber-400 text-slate-950 font-semibold text-sm shrink-0">Add</button>
-            <button onClick={() => { setAddingNew(false); setNewClientName(""); }} className="px-2 text-slate-500 shrink-0"><X size={16} /></button>
-          </div>
+          </Field>
+        </>
+      ) : (
+        <Field label="Split hours across">
+          <SplitEditor total={hrsRounded || 0} unit="hrs" splits={splits} onChange={setSplits} clients={clients} />
         </Field>
       )}
-      <Field label="Job number (optional)">
-        <input
-          value={jobNumber}
-          onChange={(e) => setJobNumber(e.target.value)}
-          placeholder="e.g. 4521 — leave blank if not generated yet"
-          className={inputClsPlain}
-        />
-      </Field>
+      <button
+        onClick={() => {
+          if (!splitMode && splits.length === 0) setSplits([{ businessType: "chargeable", client: "", jobNumber: "", amount: "" }]);
+          setSplitMode(!splitMode);
+        }}
+        className="text-xs text-sky-400 font-medium mb-2 block"
+      >
+        {splitMode ? "← Use a single type instead" : "Split this session across multiple jobs →"}
+      </button>
       {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
     </Modal>
   );
@@ -2259,6 +2183,83 @@ function ImportCsvModal({ onClose, onImport }) {
   );
 }
 
+// Shared by FullTripModal (km) and FullWorkSessionModal (hours) — lets a
+// single trip/session be divided across multiple category/client/job
+// allocations, since real driving or work time doesn't always fall cleanly
+// under one tag.
+function SplitEditor({ total, unit, splits, onChange, clients }) {
+  function updateSplit(i, patch) {
+    onChange(splits.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  }
+  function addSplit() {
+    onChange([...splits, { businessType: "chargeable", client: "", jobNumber: "", amount: "" }]);
+  }
+  function removeSplit(i) {
+    onChange(splits.filter((_, idx) => idx !== i));
+  }
+  const allocated = splits.reduce((sum, s) => sum + (Number(s.amount) || 0), 0);
+  const remaining = Math.round((total - allocated) * 100) / 100;
+
+  return (
+    <div className="space-y-3">
+      {splits.map((s, i) => (
+        <div key={i} className="rounded-xl bg-slate-800/50 border border-slate-700 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-400 font-medium">Split {i + 1}</span>
+            <button onClick={() => removeSplit(i)}><X size={14} className="text-slate-500" /></button>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => updateSplit(i, { businessType: "admin", client: "", jobNumber: "" })}
+              className={`flex-1 py-2 rounded-lg border text-xs font-semibold ${s.businessType !== "chargeable" ? "bg-slate-700 border-slate-500 text-slate-100" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+            >
+              Admin
+            </button>
+            <button
+              onClick={() => updateSplit(i, { businessType: "chargeable" })}
+              className={`flex-1 py-2 rounded-lg border text-xs font-semibold ${s.businessType === "chargeable" ? "bg-sky-400/15 border-sky-400 text-sky-400" : "bg-slate-800 border-slate-700 text-slate-500"}`}
+            >
+              Chargeable
+            </button>
+          </div>
+          {s.businessType === "chargeable" && (
+            <select
+              value={clients.includes(s.client) ? s.client : ""}
+              onChange={(e) => updateSplit(i, { client: e.target.value })}
+              className={inputClsPlain}
+            >
+              <option value="">Select client…</option>
+              {clients.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+          {s.businessType === "chargeable" && (
+            <input
+              value={s.jobNumber}
+              onChange={(e) => updateSplit(i, { jobNumber: e.target.value })}
+              placeholder="Job number (optional)"
+              className={inputClsPlain}
+            />
+          )}
+          <input
+            type="number"
+            step="0.01"
+            value={s.amount}
+            onChange={(e) => updateSplit(i, { amount: e.target.value })}
+            placeholder={`${unit} for this split`}
+            className={inputCls}
+          />
+        </div>
+      ))}
+      <button onClick={addSplit} className="w-full py-2.5 rounded-xl border border-dashed border-slate-700 text-slate-400 text-sm font-medium">
+        + Add another split
+      </button>
+      <div className={`text-xs font-medium ${remaining === 0 ? "text-emerald-400" : "text-amber-400"}`}>
+        {remaining === 0 ? `Fully allocated (${total} ${unit})` : `${remaining} ${unit} left to allocate`}
+      </div>
+    </div>
+  );
+}
+
 function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients, onAddClient }) {
   const [date, setDate] = useState(initial?.date || todayStr());
   const [timeOut, setTimeOut] = useState(initial?.timeOut || nowTimeStr());
@@ -2277,6 +2278,8 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients,
   const [purpose, setPurpose] = useState(initial?.purpose || "");
   const [jobNumber, setJobNumber] = useState(initial?.jobNumber || "");
   const [siteNotes, setSiteNotes] = useState(initial?.siteNotes || "");
+  const [splitMode, setSplitMode] = useState(!!(initial?.splits && initial.splits.length > 0));
+  const [splits, setSplits] = useState(initial?.splits || []);
   const [error, setError] = useState("");
 
   const km = mileageOut && mileageIn && !Number.isNaN(Number(mileageOut)) && !Number.isNaN(Number(mileageIn))
@@ -2286,12 +2289,23 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients,
     if (!fromLocation.trim() || !toLocation.trim()) return setError("Fill in both locations.");
     if (!mileageOut || !mileageIn) return setError("Enter both odometer readings.");
     if (Number(mileageIn) <= Number(mileageOut)) return setError("Odometer in must be greater than odometer out.");
+    if (splitMode) {
+      if (splits.length === 0) return setError("Add at least one split, or turn split off.");
+      const allocated = splits.reduce((sum, s) => sum + (Number(s.amount) || 0), 0);
+      if (Math.abs(allocated - km) > 0.5) return setError(`Splits total ${allocated} km, but the trip is ${km} km — adjust so they match.`);
+      if (splits.some((s) => s.businessType === "chargeable" && !s.client)) return setError("Every chargeable split needs a client.");
+    }
     setError("");
     onSave({
       date, timeOut, mileageOut, fromLocation: fromLocation.trim(), timeIn, mileageIn,
-      toLocation: toLocation.trim(), category, businessType, client, purpose, jobNumber, siteNotes,
+      toLocation: toLocation.trim(),
+      category: splitMode ? "business" : category,
+      businessType: splitMode ? null : businessType,
+      client: splitMode ? "" : client,
+      purpose, jobNumber: splitMode ? "" : jobNumber, siteNotes,
       fromLocationCoords: fromCustom ? fromCoords : null,
       toLocationCoords: toCustom ? toCoords : null,
+      splits: splitMode ? splits.map((s) => ({ ...s, amount: Number(s.amount) || 0 })) : [],
     });
   }
 
@@ -2343,12 +2357,25 @@ function FullTripModal({ locations, initial, onClose, onSave, onDelete, clients,
         <LocationChips locations={locations} value={toLocation} onChange={setToLocation} customMode={toCustom} onToggleCustom={setToCustom} />
       </Field>
       <Field label="Trip type">
-        <CategoryToggle
-          value={category} onChange={setCategory}
-          businessType={businessType} onBusinessTypeChange={setBusinessType}
-          client={client} onClientChange={setClient}
-          clients={clients} onAddClient={onAddClient}
-        />
+        {!splitMode ? (
+          <CategoryToggle
+            value={category} onChange={setCategory}
+            businessType={businessType} onBusinessTypeChange={setBusinessType}
+            client={client} onClientChange={setClient}
+            clients={clients} onAddClient={onAddClient}
+          />
+        ) : (
+          <SplitEditor total={km || 0} unit="km" splits={splits} onChange={setSplits} clients={clients} />
+        )}
+        <button
+          onClick={() => {
+            if (!splitMode && splits.length === 0) setSplits([{ businessType: "chargeable", client: "", jobNumber: "", amount: "" }]);
+            setSplitMode(!splitMode);
+          }}
+          className="text-xs text-sky-400 font-medium mt-2"
+        >
+          {splitMode ? "← Use a single category instead" : "Split this trip across multiple jobs →"}
+        </button>
       </Field>
       <Field label="Purpose (optional)"><input value={purpose} onChange={(e) => setPurpose(e.target.value)} placeholder="e.g. Site inspection" className={inputClsPlain} /></Field>
       <div className="mb-1 pl-3 border-l-2 border-slate-800">
