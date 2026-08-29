@@ -255,8 +255,3 @@ between phone, laptop, wherever you sign in. A few things worth knowing:
 - Firestore's free tier covers this app's usage many times over for a single user.
 
 Still worth using the **Export CSV** button in the Summary tab periodically as an independent backup.
-
-## Updating the app later
-
-If Claude gives you an updated `MileageLogger.jsx` in the future, you can just replace
-`src/MileageLogger.jsx` with the new version — nothing else needs to change.
