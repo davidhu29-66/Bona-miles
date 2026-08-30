@@ -282,7 +282,16 @@ export default function MileageLogger() {
       }
       try {
         const res = await window.storage.get("clients", false);
-        const loadedClients = res ? JSON.parse(res.value) : [];
+        const rawClients = res ? JSON.parse(res.value) : [];
+        // Defensive migration: everywhere else in this file treats a client
+        // as a plain string. If storage holds object-shaped entries instead
+        // (e.g. { name, sites } from the in-progress Client/Site data model
+        // work, or any future evolution of that shape), pull just the name
+        // out here so nothing downstream ever tries to render/compare the
+        // object itself — same pattern as the locations migration above.
+        const loadedClients = rawClients
+          .map((c) => (typeof c === "string" ? c : (c && typeof c === "object" ? c.name : null)))
+          .filter((c) => typeof c === "string" && c.trim().length > 0);
         if (loadedClients.length === 0 && loadedTrips.length > 0) {
           // One-time migration: this list used to be free-text per trip.
           // Seed it from whatever client names already appear in history so
