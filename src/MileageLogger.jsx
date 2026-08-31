@@ -280,7 +280,17 @@ export default function MileageLogger() {
       }
       try {
         const res = await window.storage.get("clients", false);
-        const loadedClients = res ? JSON.parse(res.value) : [];
+        const rawClients = res ? JSON.parse(res.value) : [];
+        // Defensive normalization, same pattern as locations above: some
+        // stored entries are richer objects (e.g. { name, sites: [...] })
+        // rather than the plain strings this UI renders/compares against.
+        // Rendering an object directly as a JSX child crashes React, so pull
+        // out just the name here. NOTE: this only affects what's read into
+        // memory — it does not touch Firestore, so no data is deleted by
+        // this step alone (see persistClients below for what happens on save).
+        const loadedClients = rawClients
+          .map((c) => (typeof c === "string" ? c : (c && c.name) || ""))
+          .filter(Boolean);
         if (loadedClients.length === 0 && loadedTrips.length > 0) {
           // One-time migration: this list used to be free-text per trip.
           // Seed it from whatever client names already appear in history so
