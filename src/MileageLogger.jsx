@@ -3,13 +3,18 @@ import {
   Gauge, Clock, Plus, X, Trash2, Settings as SettingsIcon,
   List, BarChart3, ChevronLeft, ChevronRight, Briefcase, Home as HomeIcon,
   Download, ArrowRight, AlertTriangle, Check, Car, LocateFixed, MapPin, Receipt,
-  FileSpreadsheet, SplitSquareHorizontal,
+  FileSpreadsheet, SplitSquareHorizontal, ClipboardCheck,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell,
 } from "recharts";
 import { generateTimesheetBlob, lastWeekAnchor } from "./generateTimesheet.js";
 import { weekRange } from "./timesheetLogic.js";
+import { generateVehicleCheckBlob } from "./generateVehicleCheck.js";
+import {
+  DAILY_SECTIONS, WEEKLY_ITEMS, FIRE_EXT_ITEMS,
+  getDailyCheckForDate, getWeeklyCheckForWeek, isDailyCheckComplete, isWeeklyCheckComplete,
+} from "./vehicleCheckLogic.js";
 
 const DEFAULT_LOCATIONS = [{ name: "Home", lat: null, lng: null }, { name: "Office", lat: null, lng: null }];
 const GPS_MATCH_RADIUS_M = 200;
@@ -192,20 +197,6 @@ function bgForCategoryAtRest(category, businessType) {
 // A "site visit" isn't stored directly — it's derived from two consecutive
 // completed trips where one arrives somewhere and the very next trip departs
 // from that same place. The time between them is time on site.
-// The (businessType, client, jobNumber, km) allocations a trip actually
-// resolves to for reporting — its splits if it has any (each split's
-// `amount` is already km), otherwise its own single top-level tag with the
-// trip's full km. Mirrors allocationsOf() in timesheetLogic.js so the
-// Summary tab and CSV export stay consistent with how the generated
-// timesheet itself attributes a split trip, instead of only ever reading
-// the (deliberately blank, for a split trip) top-level businessType/client.
-function tripAllocationsKm(t) {
-  if (t.splits && t.splits.length > 0) {
-    return t.splits.map((s) => ({ businessType: s.businessType, client: s.client, jobNumber: s.jobNumber, km: Number(s.amount) || 0 }));
-  }
-  return [{ businessType: t.businessType, client: t.client, jobNumber: t.jobNumber, km: t.mileageIn - t.mileageOut }];
-}
-
 // Private arrivals (home, personal stops) are deliberately excluded — this
 // list feeds job/billing tracking, not personal time.
 function computeSiteVisits(trips) {
@@ -248,6 +239,11 @@ export default function MileageLogger() {
   const [activeTimer, setActiveTimer] = useState(null);
   const [timesheetName, setTimesheetName] = useState("");
   const [timesheetRegion, setTimesheetRegion] = useState("");
+  const [vehicleInfo, setVehicleInfo] = useState({
+    registration: "", makeModel: "", licenseExpiry: "", lastServiceKm: "", lastServiceDate: "", nextServiceKm: "",
+  });
+  const [vehicleDailyChecks, setVehicleDailyChecks] = useState([]);
+  const [vehicleWeeklyChecks, setVehicleWeeklyChecks] = useState([]);
   const [tab, setTab] = useState("log");
   const [toast, setToast] = useState(null);
 
@@ -259,6 +255,8 @@ export default function MileageLogger() {
   const [editingTrip, setEditingTrip] = useState(null);
   const [showFullSession, setShowFullSession] = useState(false);
   const [editingSession, setEditingSession] = useState(null);
+  const [showDailyVehicleCheck, setShowDailyVehicleCheck] = useState(false);
+  const [showWeeklyVehicleCheck, setShowWeeklyVehicleCheck] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null); // { id, type: "trip" | "session" }
 
   useEffect(() => {
@@ -282,16 +280,7 @@ export default function MileageLogger() {
       }
       try {
         const res = await window.storage.get("clients", false);
-        const rawClients = res ? JSON.parse(res.value) : [];
-        // Defensive migration: everywhere else in this file treats a client
-        // as a plain string. If storage holds object-shaped entries instead
-        // (e.g. { name, sites } from the in-progress Client/Site data model
-        // work, or any future evolution of that shape), pull just the name
-        // out here so nothing downstream ever tries to render/compare the
-        // object itself — same pattern as the locations migration above.
-        const loadedClients = rawClients
-          .map((c) => (typeof c === "string" ? c : (c && typeof c === "object" ? c.name : null)))
-          .filter((c) => typeof c === "string" && c.trim().length > 0);
+        const loadedClients = res ? JSON.parse(res.value) : [];
         if (loadedClients.length === 0 && loadedTrips.length > 0) {
           // One-time migration: this list used to be free-text per trip.
           // Seed it from whatever client names already appear in history so
@@ -332,6 +321,26 @@ export default function MileageLogger() {
         setTimesheetRegion(s.timesheetRegion || "");
       } catch (e) {
         // no settings saved yet — defaults are fine
+      }
+      try {
+        const res = await window.storage.get("vehicleInfo", false);
+        setVehicleInfo(res ? JSON.parse(res.value) : {
+          registration: "", makeModel: "", licenseExpiry: "", lastServiceKm: "", lastServiceDate: "", nextServiceKm: "",
+        });
+      } catch (e) {
+        // no vehicle info saved yet — defaults are fine
+      }
+      try {
+        const res = await window.storage.get("vehicleDailyChecks", false);
+        setVehicleDailyChecks(res ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setVehicleDailyChecks([]);
+      }
+      try {
+        const res = await window.storage.get("vehicleWeeklyChecks", false);
+        setVehicleWeeklyChecks(res ? JSON.parse(res.value) : []);
+      } catch (e) {
+        setVehicleWeeklyChecks([]);
       }
       setLoading(false);
     })();
@@ -468,6 +477,89 @@ export default function MileageLogger() {
     }
   }
 
+  async function persistVehicleInfo(next) {
+    setVehicleInfo(next);
+    try {
+      await window.storage.set("vehicleInfo", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save vehicle info.");
+    }
+  }
+
+  async function persistVehicleDailyChecks(next) {
+    setVehicleDailyChecks(next);
+    try {
+      await window.storage.set("vehicleDailyChecks", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that vehicle check.");
+    }
+  }
+
+  async function persistVehicleWeeklyChecks(next) {
+    setVehicleWeeklyChecks(next);
+    try {
+      await window.storage.set("vehicleWeeklyChecks", JSON.stringify(next), false);
+    } catch (e) {
+      showToast("error", "Couldn't save that vehicle check.");
+    }
+  }
+
+  // Keyed by date — logging today's check again edits today's record rather
+  // than creating a duplicate, same idea as one trip per Start/End pair.
+  function saveDailyVehicleCheck(data) {
+    const existingIdx = vehicleDailyChecks.findIndex((c) => c.date === data.date);
+    const record = { id: existingIdx >= 0 ? vehicleDailyChecks[existingIdx].id : uid(), ...data };
+    const next = existingIdx >= 0
+      ? vehicleDailyChecks.map((c, i) => (i === existingIdx ? record : c))
+      : [...vehicleDailyChecks, record];
+    persistVehicleDailyChecks(next);
+    setShowDailyVehicleCheck(false);
+    showToast("success", "Vehicle check logged.");
+  }
+
+  // Keyed by weekStart (the Monday) — one weekly check per week.
+  function saveWeeklyVehicleCheck(data) {
+    const existingIdx = vehicleWeeklyChecks.findIndex((c) => c.weekStart === data.weekStart);
+    const record = { id: existingIdx >= 0 ? vehicleWeeklyChecks[existingIdx].id : uid(), ...data };
+    const next = existingIdx >= 0
+      ? vehicleWeeklyChecks.map((c, i) => (i === existingIdx ? record : c))
+      : [...vehicleWeeklyChecks, record];
+    persistVehicleWeeklyChecks(next);
+    setShowWeeklyVehicleCheck(false);
+    showToast("success", "Weekly vehicle check logged.");
+  }
+
+  const [generatingVehicleCheck, setGeneratingVehicleCheck] = useState(false);
+
+  async function handleGenerateVehicleCheck() {
+    setGeneratingVehicleCheck(true);
+    try {
+      const anchor = lastWeekAnchor();
+      const { blob, weekDays, missingDays, hasWeeklyCheck } = await generateVehicleCheckBlob(
+        vehicleInfo, vehicleDailyChecks, vehicleWeeklyChecks, anchor, timesheetName
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Vehicle-Check_${weekDays[0]}_to_${weekDays[6]}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      const gaps = [];
+      if (missingDays.length > 0) gaps.push(`${missingDays.length} day${missingDays.length === 1 ? "" : "s"} not logged`);
+      if (!hasWeeklyCheck) gaps.push("no weekly check for that week");
+      if (gaps.length > 0) {
+        showToast("error", `Generated, but ${gaps.join(" · ")}.`);
+      } else {
+        showToast("success", `Vehicle check generated: ${weekDays[0]} to ${weekDays[6]}.`);
+      }
+    } catch (e) {
+      showToast("error", "Couldn't generate the vehicle check — " + (e.message || "unknown error"));
+    }
+    setGeneratingVehicleCheck(false);
+  }
+
 
   const sortedTrips = useMemo(
     () => [...trips].sort((a, b) => (sortKey(a) < sortKey(b) ? 1 : -1)),
@@ -507,6 +599,16 @@ export default function MileageLogger() {
     if (!lastCompleted) return null;
     return bgForCategoryAtRest(lastCompleted.category, lastCompleted.businessType);
   }, [activeTrip, sortedTrips]);
+
+  const todaysVehicleCheck = useMemo(
+    () => getDailyCheckForDate(vehicleDailyChecks, todayStr()),
+    [vehicleDailyChecks]
+  );
+  const thisWeekStart = useMemo(() => weekRange(todayStr())[0], []);
+  const thisWeeksVehicleCheck = useMemo(
+    () => getWeeklyCheckForWeek(vehicleWeeklyChecks, thisWeekStart),
+    [vehicleWeeklyChecks, thisWeekStart]
+  );
 
   function upsertLocation(name, lat, lng) {
     const clean = (name || "").trim();
@@ -604,7 +706,6 @@ export default function MileageLogger() {
           purpose: data.purpose || "",
           jobNumber: data.jobNumber || "",
           siteNotes: data.siteNotes || "",
-          splits: data.splits || [],
         };
         return updated;
       });
@@ -626,7 +727,6 @@ export default function MileageLogger() {
         purpose: data.purpose || "",
         jobNumber: data.jobNumber || "",
         siteNotes: data.siteNotes || "",
-        splits: data.splits || [],
       };
       persistTrips([...trips, trip]);
       showToast("success", "Trip added.");
@@ -738,6 +838,14 @@ export default function MileageLogger() {
             onGenerateTimesheet={handleGenerateTimesheet}
             generatingTimesheet={generatingTimesheet}
             onOpenImport={() => setShowImportCsv(true)}
+            vehicleInfo={vehicleInfo}
+            onVehicleInfoChange={persistVehicleInfo}
+            todaysVehicleCheck={todaysVehicleCheck}
+            thisWeeksVehicleCheck={thisWeeksVehicleCheck}
+            onOpenDailyVehicleCheck={() => setShowDailyVehicleCheck(true)}
+            onOpenWeeklyVehicleCheck={() => setShowWeeklyVehicleCheck(true)}
+            onGenerateVehicleCheck={handleGenerateVehicleCheck}
+            generatingVehicleCheck={generatingVehicleCheck}
           />
         )}
       </main>
@@ -796,6 +904,23 @@ export default function MileageLogger() {
         <ImportCsvModal
           onClose={() => setShowImportCsv(false)}
           onImport={importTripsCsv}
+        />
+      )}
+      {showDailyVehicleCheck && (
+        <DailyVehicleCheckModal
+          initial={todaysVehicleCheck}
+          defaultSignatureName={timesheetName}
+          onClose={() => setShowDailyVehicleCheck(false)}
+          onSave={saveDailyVehicleCheck}
+        />
+      )}
+      {showWeeklyVehicleCheck && (
+        <WeeklyVehicleCheckModal
+          initial={thisWeeksVehicleCheck}
+          weekStart={thisWeekStart}
+          defaultSignatureName={timesheetName}
+          onClose={() => setShowWeeklyVehicleCheck(false)}
+          onSave={saveWeeklyVehicleCheck}
         />
       )}
       {confirmDelete && (
@@ -1125,18 +1250,15 @@ function SummaryTab({ trips }) {
   const privKm = totalKm - bizKm;
   const bizPct = totalKm > 0 ? Math.round((bizKm / totalKm) * 100) : 0;
 
-  const bizAllocations = bizTrips.flatMap(tripAllocationsKm);
-  const adminKm = bizAllocations.filter((a) => a.businessType !== "chargeable").reduce((s, a) => s + a.km, 0);
-  const chargeableAllocations = bizAllocations.filter((a) => a.businessType === "chargeable");
-  const chargeableKm = chargeableAllocations.reduce((s, a) => s + a.km, 0);
-  // A split trip always has a businessType per split (never blank), so only
-  // non-split trips missing a top-level businessType count as unspecified.
-  const unspecifiedCount = bizTrips.filter((t) => !(t.splits && t.splits.length > 0) && !t.businessType).length;
+  const adminKm = bizTrips.filter((t) => t.businessType !== "chargeable").reduce((s, t) => s + (t.mileageIn - t.mileageOut), 0);
+  const chargeableTrips = bizTrips.filter((t) => t.businessType === "chargeable");
+  const chargeableKm = chargeableTrips.reduce((s, t) => s + (t.mileageIn - t.mileageOut), 0);
+  const unspecifiedCount = bizTrips.filter((t) => !t.businessType).length;
 
   const byClient = {};
-  chargeableAllocations.forEach((a) => {
-    const key = a.client?.trim() || "No client specified";
-    byClient[key] = (byClient[key] || 0) + a.km;
+  chargeableTrips.forEach((t) => {
+    const key = t.client?.trim() || "No client specified";
+    byClient[key] = (byClient[key] || 0) + (t.mileageIn - t.mileageOut);
   });
   const clientRows = Object.entries(byClient).sort((a, b) => b[1] - a[1]);
 
@@ -1173,52 +1295,23 @@ function SummaryTab({ trips }) {
   }
 
   function exportCsv(filter) {
-    // A split trip exports as one row PER split allocation, not one row for
-    // the whole trip — each split gets its own client/job number/km, which
-    // is what's actually useful for handing a CSV to a client for billing.
-    // Non-split trips still export as a single row, unchanged.
-    const rows = [];
-    trips.forEach((t) => {
-      if (t.mileageIn === null) return;
-      if ((filter === "business" || filter === "chargeable") && t.category !== "business") return;
-
-      if (t.splits && t.splits.length > 0) {
-        t.splits.forEach((s) => {
-          if (filter === "chargeable" && s.businessType !== "chargeable") return;
-          rows.push({
-            _sortKey: sortKey(t),
-            date: t.date, timeOut: t.timeOut, fromLocation: t.fromLocation, mileageOut: t.mileageOut,
-            timeIn: t.timeIn, toLocation: t.toLocation, mileageIn: t.mileageIn,
-            km: Number(s.amount) || 0,
-            category: t.category, businessType: s.businessType || "",
-            client: s.client || "", purpose: t.purpose || "", jobNumber: s.jobNumber || "",
-            siteNotes: t.siteNotes || "",
-          });
-        });
-      } else {
-        if (filter === "chargeable" && t.businessType !== "chargeable") return;
-        rows.push({
-          _sortKey: sortKey(t),
-          date: t.date, timeOut: t.timeOut, fromLocation: t.fromLocation, mileageOut: t.mileageOut,
-          timeIn: t.timeIn, toLocation: t.toLocation, mileageIn: t.mileageIn,
-          km: t.mileageIn - t.mileageOut,
-          category: t.category, businessType: t.businessType || "",
-          client: t.client || "", purpose: t.purpose || "", jobNumber: t.jobNumber || "",
-          siteNotes: t.siteNotes || "",
-        });
-      }
-    });
-    rows.sort((a, b) => (a._sortKey > b._sortKey ? 1 : -1));
-
+    const rows = trips
+      .filter((t) => {
+        if (t.mileageIn === null) return false;
+        if (filter === "business") return t.category === "business";
+        if (filter === "chargeable") return t.category === "business" && t.businessType === "chargeable";
+        return true;
+      })
+      .sort((a, b) => (sortKey(a) > sortKey(b) ? 1 : -1));
     const header = ["Date", "Time Out", "From", "Odometer Out", "Time In", "To", "Odometer In", "KM", "Category", "Business Type", "Client", "Purpose", "Job Number", "Site Notes"];
     const lines = [header.join(",")];
-    rows.forEach((r) => {
+    rows.forEach((t) => {
       const line = [
-        r.date, r.timeOut, r.fromLocation, r.mileageOut,
-        r.timeIn, r.toLocation, r.mileageIn, r.km,
-        r.category, r.businessType, `"${r.client.replace(/"/g, '""')}"`,
-        `"${r.purpose.replace(/"/g, '""')}"`, r.jobNumber,
-        `"${r.siteNotes.replace(/"/g, '""')}"`,
+        t.date, t.timeOut, t.fromLocation, t.mileageOut,
+        t.timeIn, t.toLocation, t.mileageIn, t.mileageIn - t.mileageOut,
+        t.category, t.businessType || "", `"${(t.client || "").replace(/"/g, '""')}"`,
+        `"${(t.purpose || "").replace(/"/g, '""')}"`, t.jobNumber || "",
+        `"${(t.siteNotes || "").replace(/"/g, '""')}"`,
       ];
       lines.push(line.join(","));
     });
@@ -1377,6 +1470,8 @@ function SettingsTab({
   clients, onAddClient, onRemoveClient,
   timesheetName, timesheetRegion, onTimesheetNameChange, onTimesheetRegionChange,
   onGenerateTimesheet, generatingTimesheet, onOpenImport,
+  vehicleInfo, onVehicleInfoChange, todaysVehicleCheck, thisWeeksVehicleCheck,
+  onOpenDailyVehicleCheck, onOpenWeeklyVehicleCheck, onGenerateVehicleCheck, generatingVehicleCheck,
 }) {
   const [newLoc, setNewLoc] = useState("");
   const [newClient, setNewClient] = useState("");
@@ -1384,6 +1479,11 @@ function SettingsTab({
   const [pinError, setPinError] = useState("");
   const [nameDraft, setNameDraft] = useState(timesheetName);
   const [regionDraft, setRegionDraft] = useState(timesheetRegion);
+  const [vInfoDraft, setVInfoDraft] = useState(vehicleInfo);
+
+  function commitVInfo(next) {
+    onVehicleInfoChange(next || vInfoDraft);
+  }
 
   async function handlePin(name) {
     setPinningName(name);
@@ -1510,6 +1610,89 @@ function SettingsTab({
           className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform disabled:opacity-50 mt-1"
         >
           <FileSpreadsheet size={16} /> {generatingTimesheet ? "Generating…" : "Generate last week's timesheet"}
+        </button>
+      </div>
+
+      <div className="rounded-2xl bg-slate-900/50 border border-slate-800/60 p-4">
+        <div className="text-sm font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+          <ClipboardCheck size={14} className="text-amber-400" /> Vehicle check
+        </div>
+        <div className="text-xs text-slate-500 mb-3">
+          Digital version of the EI-008 vehicle inspection form. Log a daily check before you drive,
+          a weekly check (tyres, fire extinguisher, vehicle condition) once a week, then generate
+          last week's filled-in sheet to submit.
+        </div>
+        <div className="grid grid-cols-2 gap-3 mb-1">
+          <Field label="Registration No.">
+            <input
+              value={vInfoDraft.registration || ""}
+              onChange={(e) => setVInfoDraft({ ...vInfoDraft, registration: e.target.value })}
+              onBlur={() => commitVInfo()}
+              className={inputClsPlain}
+            />
+          </Field>
+          <Field label="Make/Model">
+            <input
+              value={vInfoDraft.makeModel || ""}
+              onChange={(e) => setVInfoDraft({ ...vInfoDraft, makeModel: e.target.value })}
+              onBlur={() => commitVInfo()}
+              className={inputClsPlain}
+            />
+          </Field>
+          <Field label="License Expiry">
+            <input
+              type="date"
+              value={vInfoDraft.licenseExpiry || ""}
+              onChange={(e) => { const next = { ...vInfoDraft, licenseExpiry: e.target.value }; setVInfoDraft(next); commitVInfo(next); }}
+              className={inputClsPlain}
+            />
+          </Field>
+          <Field label="Last Service Km's">
+            <input
+              inputMode="numeric"
+              value={vInfoDraft.lastServiceKm || ""}
+              onChange={(e) => setVInfoDraft({ ...vInfoDraft, lastServiceKm: e.target.value })}
+              onBlur={() => commitVInfo()}
+              className={inputClsPlain}
+            />
+          </Field>
+          <Field label="Last Service Date">
+            <input
+              type="date"
+              value={vInfoDraft.lastServiceDate || ""}
+              onChange={(e) => { const next = { ...vInfoDraft, lastServiceDate: e.target.value }; setVInfoDraft(next); commitVInfo(next); }}
+              className={inputClsPlain}
+            />
+          </Field>
+          <Field label="Next Service Km's">
+            <input
+              inputMode="numeric"
+              value={vInfoDraft.nextServiceKm || ""}
+              onChange={(e) => setVInfoDraft({ ...vInfoDraft, nextServiceKm: e.target.value })}
+              onBlur={() => commitVInfo()}
+              className={inputClsPlain}
+            />
+          </Field>
+        </div>
+
+        <button
+          onClick={onOpenDailyVehicleCheck}
+          className={`w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 mb-2 mt-2 ${todaysVehicleCheck ? "bg-slate-800 text-slate-300" : "bg-amber-400/10 border border-amber-400/30 text-amber-400"}`}
+        >
+          <Check size={14} /> {todaysVehicleCheck ? "Edit today's check" : "Log today's check"}
+        </button>
+        <button
+          onClick={onOpenWeeklyVehicleCheck}
+          className={`w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 mb-2 ${thisWeeksVehicleCheck ? "bg-slate-800 text-slate-300" : "bg-sky-400/10 border border-sky-400/30 text-sky-400"}`}
+        >
+          <ClipboardCheck size={14} /> {thisWeeksVehicleCheck ? "Edit this week's weekly check" : "Log this week's weekly check"}
+        </button>
+        <button
+          onClick={onGenerateVehicleCheck}
+          disabled={generatingVehicleCheck}
+          className="w-full py-3.5 rounded-xl bg-emerald-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition-transform disabled:opacity-50"
+        >
+          <FileSpreadsheet size={16} /> {generatingVehicleCheck ? "Generating…" : "Generate last week's vehicle check"}
         </button>
       </div>
 
@@ -2149,6 +2332,189 @@ function FullWorkSessionModal({ initial, onClose, onSave, onDelete, clients, onA
       >
         {splitMode ? "← Use a single type instead" : "Split this session across multiple jobs →"}
       </button>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Shared Yes/No control for vehicle-check items — deliberately a forced
+// choice (no default) so a saved check always means "someone actually looked
+// at this", not "left blank = fine".
+function YesNoToggle({ value, onChange }) {
+  return (
+    <div className="flex gap-1.5 shrink-0">
+      <button
+        type="button"
+        onClick={() => onChange(true)}
+        className={`w-9 h-8 rounded-lg text-xs font-bold flex items-center justify-center transition-colors ${value === true ? "bg-emerald-400 text-slate-950" : "bg-slate-800 border border-slate-700 text-slate-500"}`}
+      >
+        Y
+      </button>
+      <button
+        type="button"
+        onClick={() => onChange(false)}
+        className={`w-9 h-8 rounded-lg text-xs font-bold flex items-center justify-center transition-colors ${value === false ? "bg-rose-500 text-white" : "bg-slate-800 border border-slate-700 text-slate-500"}`}
+      >
+        N
+      </button>
+    </div>
+  );
+}
+
+function ChecklistRow({ label, value, onChange }) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-2 border-b border-slate-800/60 last:border-b-0">
+      <span className="text-sm text-slate-300 flex-1">{label}</span>
+      <YesNoToggle value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+// Daily vehicle check — the 21 items from sections 1-4 of the EI-008 form.
+// Keyed by date: opening this for a day that already has a record edits it
+// in place, same idea as one trip per Start/End pair.
+function DailyVehicleCheckModal({ initial, defaultSignatureName, onClose, onSave }) {
+  const [date, setDate] = useState(initial?.date || todayStr());
+  const [items, setItems] = useState(initial?.items || {});
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [signatureName, setSignatureName] = useState(initial?.signatureName || defaultSignatureName || "");
+  const [signatureTime, setSignatureTime] = useState(initial?.signatureTime || nowTimeStr());
+  const [error, setError] = useState("");
+
+  function setItem(id, val) {
+    setItems((prev) => ({ ...prev, [id]: val }));
+  }
+  function markAllOk() {
+    const next = {};
+    DAILY_SECTIONS.forEach((s) => s.items.forEach((i) => (next[i.id] = true)));
+    setItems(next);
+  }
+
+  function submit() {
+    if (!isDailyCheckComplete(items)) return setError("Every item needs a Yes or No before saving.");
+    if (!signatureName.trim()) return setError("Add your name to sign off the check.");
+    setError("");
+    onSave({ date, items, notes, signatureName: signatureName.trim(), signatureTime });
+  }
+
+  const failCount = Object.values(items).filter((v) => v === false).length;
+
+  return (
+    <Modal
+      title="Daily Vehicle Check"
+      onClose={onClose}
+      footer={
+        <div>
+          {failCount > 0 && (
+            <div className="text-center mb-3 text-rose-400 text-xs font-semibold flex items-center justify-center gap-1.5">
+              <AlertTriangle size={13} /> {failCount} item{failCount === 1 ? "" : "s"} flagged — add details in Notes.
+            </div>
+          )}
+          <button onClick={submit} className="w-full py-3.5 rounded-xl bg-amber-400 text-slate-950 font-bold flex items-center justify-center gap-2">
+            <Check size={16} /> Save Check
+          </button>
+        </div>
+      }
+    >
+      <Field label="Date"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClsPlain} /></Field>
+      <button onClick={markAllOk} className="text-xs text-sky-400 font-medium mb-3 block">
+        Mark everything OK, then flag exceptions →
+      </button>
+      {DAILY_SECTIONS.map((section) => (
+        <div key={section.title} className="mb-3">
+          <div className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-1">{section.title}</div>
+          <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3">
+            {section.items.map((item) => (
+              <ChecklistRow key={item.id} label={item.label} value={items[item.id]} onChange={(v) => setItem(item.id, v)} />
+            ))}
+          </div>
+          {section.note && <div className="text-xs text-slate-600 italic mt-1">{section.note}</div>}
+        </div>
+      ))}
+      <Field label="Notes (any defects found)">
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="Optional" className={inputClsPlain} />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Signed by"><input value={signatureName} onChange={(e) => setSignatureName(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="Time"><input type="time" value={signatureTime} onChange={(e) => setSignatureTime(e.target.value)} className={inputCls} /></Field>
+      </div>
+      {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
+    </Modal>
+  );
+}
+
+// Weekly vehicle check — tyres/vehicle condition + fire extinguisher, plus
+// sign-off. Keyed by weekStart (the Monday), one record per week.
+function WeeklyVehicleCheckModal({ initial, weekStart, defaultSignatureName, onClose, onSave }) {
+  const [items, setItems] = useState(initial?.items || {});
+  const [fireExt, setFireExt] = useState(initial?.fireExt || {});
+  const [conditionNotes, setConditionNotes] = useState(initial?.conditionNotes || "");
+  const [signatureName, setSignatureName] = useState(initial?.signatureName || defaultSignatureName || "");
+  const [signatureDate, setSignatureDate] = useState(initial?.signatureDate || todayStr());
+  const [crossCheckedBy, setCrossCheckedBy] = useState(initial?.crossCheckedBy || "");
+  const [crossCheckedDate, setCrossCheckedDate] = useState(initial?.crossCheckedDate || "");
+  const [error, setError] = useState("");
+
+  function setItem(id, val) { setItems((prev) => ({ ...prev, [id]: val })); }
+  function setFe(id, val) { setFireExt((prev) => ({ ...prev, [id]: val })); }
+  function markAllOk() {
+    const nextItems = {}; WEEKLY_ITEMS.forEach((i) => (nextItems[i.id] = true));
+    const nextFe = {}; FIRE_EXT_ITEMS.forEach((i) => (nextFe[i.id] = true));
+    setItems(nextItems); setFireExt(nextFe);
+  }
+
+  function submit() {
+    if (!isWeeklyCheckComplete(items, fireExt)) return setError("Every item needs a Yes or No before saving.");
+    if (!signatureName.trim()) return setError("Add your name to sign off the check.");
+    setError("");
+    onSave({
+      weekStart, items, fireExt, conditionNotes,
+      signatureName: signatureName.trim(), signatureDate,
+      crossCheckedBy: crossCheckedBy.trim(), crossCheckedDate,
+    });
+  }
+
+  return (
+    <Modal
+      title="Weekly Vehicle Check"
+      onClose={onClose}
+      footer={
+        <button onClick={submit} className="w-full py-3.5 rounded-xl bg-amber-400 text-slate-950 font-bold flex items-center justify-center gap-2">
+          <Check size={16} /> Save Check
+        </button>
+      }
+    >
+      <div className="text-xs text-slate-500 mb-3">Week starting {fmtDateLong(weekStart)}</div>
+      <button onClick={markAllOk} className="text-xs text-sky-400 font-medium mb-3 block">
+        Mark everything OK, then flag exceptions →
+      </button>
+      <div className="mb-3">
+        <div className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-1">Vehicle</div>
+        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3">
+          {WEEKLY_ITEMS.map((item) => (
+            <ChecklistRow key={item.id} label={item.label} value={items[item.id]} onChange={(v) => setItem(item.id, v)} />
+          ))}
+        </div>
+      </div>
+      <div className="mb-3">
+        <div className="text-xs font-bold uppercase tracking-wide text-slate-500 mb-1">Fire Extinguisher Check</div>
+        <div className="rounded-xl bg-slate-800/40 border border-slate-800 px-3">
+          {FIRE_EXT_ITEMS.map((item) => (
+            <ChecklistRow key={item.id} label={item.label} value={fireExt[item.id]} onChange={(v) => setFe(item.id, v)} />
+          ))}
+        </div>
+      </div>
+      <Field label="Vehicle condition notes (damage, scratches, etc.)">
+        <textarea value={conditionNotes} onChange={(e) => setConditionNotes(e.target.value)} rows={2} placeholder="Optional" className={inputClsPlain} />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Signed by"><input value={signatureName} onChange={(e) => setSignatureName(e.target.value)} className={inputClsPlain} /></Field>
+        <Field label="Date"><input type="date" value={signatureDate} onChange={(e) => setSignatureDate(e.target.value)} className={inputClsPlain} /></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Cross-checked by"><input value={crossCheckedBy} onChange={(e) => setCrossCheckedBy(e.target.value)} placeholder="Optional" className={inputClsPlain} /></Field>
+        <Field label="Date"><input type="date" value={crossCheckedDate} onChange={(e) => setCrossCheckedDate(e.target.value)} className={inputClsPlain} /></Field>
+      </div>
       {error && <div className="text-rose-400 text-xs flex items-center gap-1.5 mb-1"><AlertTriangle size={13} /> {error}</div>}
     </Modal>
   );
