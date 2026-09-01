@@ -66,6 +66,16 @@ function fmtKm(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: 1 });
 }
+// Renders a client value safely as text even if it's unexpectedly
+// object-shaped (defensive against legacy/malformed data) — returns the
+// name if present, otherwise an empty string, rather than handing a raw
+// object to React (which crashes) or to string methods like .trim() that
+// only exist on strings.
+function clientLabel(c) {
+  if (typeof c === "string") return c;
+  if (c && typeof c === "object" && typeof c.name === "string") return c.name;
+  return "";
+}
 function fmtDateLong(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
@@ -236,12 +246,12 @@ function tripAllocations(t) {
   if (t.splits && t.splits.length > 0) {
     return t.splits.map((s) => ({
       businessType: s.businessType,
-      client: s.client || "",
+      client: clientLabel(s.client),
       jobNumber: s.jobNumber || "",
       km: Number(s.amount) || 0,
     }));
   }
-  return [{ businessType: t.businessType, client: t.client || "", jobNumber: t.jobNumber || "", km: totalKm }];
+  return [{ businessType: t.businessType, client: clientLabel(t.client), jobNumber: t.jobNumber || "", km: totalKm }];
 }
 
 export default function MileageLogger() {
@@ -287,17 +297,38 @@ export default function MileageLogger() {
       }
       try {
         const res = await window.storage.get("clients", false);
-        const loadedClients = res ? JSON.parse(res.value) : [];
+        const rawClients = res ? JSON.parse(res.value) : [];
+        // Every part of the app renders a client as plain text (Settings
+        // list, dropdown options) — an object-shaped entry crashes that
+        // render with "Objects are not valid as a React child". Normalize
+        // defensively on load so a stray object (e.g. from in-progress work
+        // on the planned Site-per-client model) can't take the app down.
+        const hasObjectEntries = rawClients.some((c) => typeof c !== "string");
+        const seen = new Set();
+        const loadedClients = [];
+        rawClients.forEach((c) => {
+          const raw = typeof c === "string" ? c : (c && typeof c === "object" && typeof c.name === "string" ? c.name : "");
+          const name = (raw || "").trim();
+          if (!name || seen.has(name.toLowerCase())) return;
+          seen.add(name.toLowerCase());
+          loadedClients.push(name);
+        });
+        if (hasObjectEntries) {
+          // Preserve the untouched original under a backup key before
+          // overwriting — some entries may have carried extra data (like a
+          // sites list) that nothing else reads yet, so it isn't lost.
+          await window.storage.set("clients_backup_pre_normalize", JSON.stringify(rawClients), false).catch(() => {});
+        }
         if (loadedClients.length === 0 && loadedTrips.length > 0) {
           // One-time migration: this list used to be free-text per trip.
           // Seed it from whatever client names already appear in history so
           // nothing "disappears" the first time this list is used.
-          const seen = new Set();
+          const seenSeed = new Set();
           const seeded = [];
           for (const t of loadedTrips) {
             const name = t.client && t.client.trim();
-            if (name && !seen.has(name.toLowerCase())) {
-              seen.add(name.toLowerCase());
+            if (name && !seenSeed.has(name.toLowerCase())) {
+              seenSeed.add(name.toLowerCase());
               seeded.push(name);
             }
           }
@@ -305,6 +336,7 @@ export default function MileageLogger() {
           if (seeded.length) await window.storage.set("clients", JSON.stringify(seeded), false);
         } else {
           setClients(loadedClients);
+          if (hasObjectEntries) await window.storage.set("clients", JSON.stringify(loadedClients), false);
         }
       } catch (e) {
         setClients([]);
@@ -868,7 +900,7 @@ function LogTab({ activeTrip, recentTrips, onStart, onEnd, onFull, onViewAll, on
           </div>
           <div className="flex items-center justify-between mb-1">
             <span className="text-slate-400 text-sm">
-              {activeTimer.businessType === "chargeable" ? (activeTimer.client || "Chargeable") : "Admin"}
+              {activeTimer.businessType === "chargeable" ? (clientLabel(activeTimer.client) || "Chargeable") : "Admin"}
             </span>
             {activeTimer.jobNumber && <span className="text-slate-500 text-xs">Job #{activeTimer.jobNumber}</span>}
           </div>
@@ -1010,7 +1042,7 @@ function SessionRow({ session, onClick, compact }) {
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1 text-sm font-medium text-slate-100 truncate">
-          {isSplit ? "Split session" : isChargeable ? (session.client || "Chargeable") : "Admin"}
+          {isSplit ? "Split session" : isChargeable ? (clientLabel(session.client) || "Chargeable") : "Admin"}
         </div>
         <div className="text-xs text-slate-500">
           {fmtDateLong(session.onDate)}{!compact ? ` · ${session.onTime}–${session.offTime}` : ""}
@@ -1134,7 +1166,7 @@ function SummaryTab({ trips }) {
       const line = [
         v.date, `"${v.location.replace(/"/g, '""')}"`, v.arrivalTime, v.departureTime, v.minutes,
         v.jobNumber, `"${(v.notes || "").replace(/"/g, '""')}"`, v.category || "", v.businessType || "",
-        `"${(v.client || "").replace(/"/g, '""')}"`,
+        `"${clientLabel(v.client).replace(/"/g, '""')}"`,
       ];
       lines.push(line.join(","));
     });
