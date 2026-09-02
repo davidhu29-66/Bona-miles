@@ -244,14 +244,38 @@ function computeSiteVisits(trips) {
 function tripAllocations(t) {
   const totalKm = t.mileageIn - t.mileageOut;
   if (t.splits && t.splits.length > 0) {
-    return t.splits.map((s) => ({
-      businessType: s.businessType,
-      client: clientLabel(s.client),
-      jobNumber: s.jobNumber || "",
-      km: Number(s.amount) || 0,
-    }));
+    // Chain each split's odometer range in entry order: the first split
+    // starts at the trip's real "out" reading, each next split picks up
+    // where the previous one left off, and the last split is anchored to
+    // the trip's real "in" reading (rather than running-sum accumulation)
+    // so any small rounding slack in the entered amounts lands only on the
+    // final segment instead of drifting across all of them. KM is always
+    // computed as that segment's own in-minus-out, so it never disagrees
+    // with the odometer pair on its row.
+    let runningOut = t.mileageOut;
+    return t.splits.map((s, i) => {
+      const amount = Number(s.amount) || 0;
+      const segOut = runningOut;
+      const segIn = i === t.splits.length - 1 ? t.mileageIn : runningOut + amount;
+      runningOut = segIn;
+      return {
+        businessType: s.businessType,
+        client: clientLabel(s.client),
+        jobNumber: s.jobNumber || "",
+        km: segIn - segOut,
+        mileageOut: segOut,
+        mileageIn: segIn,
+      };
+    });
   }
-  return [{ businessType: t.businessType, client: clientLabel(t.client), jobNumber: t.jobNumber || "", km: totalKm }];
+  return [{
+    businessType: t.businessType,
+    client: clientLabel(t.client),
+    jobNumber: t.jobNumber || "",
+    km: totalKm,
+    mileageOut: t.mileageOut,
+    mileageIn: t.mileageIn,
+  }];
 }
 
 export default function MileageLogger() {
@@ -1198,16 +1222,17 @@ function SummaryTab({ trips }) {
     const header = ["Date", "Time Out", "From", "Odometer Out", "Time In", "To", "Odometer In", "KM", "Category", "Business Type", "Client", "Purpose", "Job Number", "Site Notes"];
     const lines = [header.join(",")];
     filteredTrips.forEach((t) => {
-      // Split trips emit one row per allocation (KM = that allocation's
-      // share, Odometer In/Out stay the trip's real full readings) so each
-      // client/job gets its own billable line instead of one merged row.
+      // Split trips emit one row per allocation, each with its own chained
+      // odometer range (see tripAllocations) so KM always equals that row's
+      // own Odometer In minus Odometer Out — not the trip's full range
+      // repeated on every split.
       const allocations = filter === "chargeable"
         ? tripAllocations(t).filter((alloc) => alloc.businessType === "chargeable")
         : tripAllocations(t);
       allocations.forEach((alloc) => {
         const line = [
-          t.date, t.timeOut, t.fromLocation, t.mileageOut,
-          t.timeIn, t.toLocation, t.mileageIn, alloc.km,
+          t.date, t.timeOut, t.fromLocation, alloc.mileageOut,
+          t.timeIn, t.toLocation, alloc.mileageIn, alloc.km,
           t.category, alloc.businessType || "", `"${alloc.client.replace(/"/g, '""')}"`,
           `"${(t.purpose || "").replace(/"/g, '""')}"`, alloc.jobNumber || "",
           `"${(t.siteNotes || "").replace(/"/g, '""')}"`,
